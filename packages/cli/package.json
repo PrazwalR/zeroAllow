@@ -1,0 +1,15 @@
+{
+  "name": "zeroallow-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "zeroallow": "src/main.ts"
+  },
+  "scripts": {
+    "test": "echo ok"
+  },
+  "dependencies": {
+    "viem": "^2.57.20",
+    "zeroallow": "workspace:*"
+  }
+}
