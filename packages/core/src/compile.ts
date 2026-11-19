@@ -1,6 +1,7 @@
-import { encodeFunctionData, isAddressEqual, zeroAddress, type Address } from 'viem'
+import { encodeAbiParameters, encodeFunctionData, isAddressEqual, zeroAddress, type Address, type Hex } from 'viem'
 import {
   ATOMIC,
+  EXEC_MODE,
   KIND,
   MAX_RESIDUAL,
   MODE,
@@ -10,14 +11,17 @@ import {
   delegationAbi,
   e6909Abi,
   erc20Abi,
+  executeAbi,
+  executionsParams,
   nftAbi,
   permit2Abi,
   sealAbi,
 } from './constants.js'
 import { classify, isGrant } from './registry.js'
+import { decodeUr, nestedPermits } from './ur.js'
 import type { Call, Classified, FrameSpec, MinOut, Quirk, SealKey } from './types.js'
 
-export type AccountKind = 'eoa' | 'zeroallow'
+export type AccountKind = 'eoa' | 'zeroallow' | 'dispatched'
 
 export type CompileInput = {
   sender: Address
@@ -28,6 +32,7 @@ export type CompileInput = {
   minOut?: MinOut[]
   quirks?: Record<string, Quirk>
   current?: Record<string, bigint>
+  verifyData?: Hex
 }
 
 export type Compiled = { frames: FrameSpec[]; grants: Classified[]; keys: SealKey[]; notes: string[] }
@@ -38,14 +43,25 @@ type Step = Call & { label: string }
 const lc = (a: Address) => a.toLowerCase()
 const pair = (token: Address, spender: Address) => `${lc(token)}:${lc(spender)}`
 
-export function verifyFrame(account: AccountKind = 'eoa'): FrameSpec {
+export function verifyFrame(account: AccountKind = 'eoa', data?: Hex): FrameSpec {
+  const fallback =
+    account === 'zeroallow'
+      ? encodeFunctionData({ abi: accountAbi, functionName: 'validate', args: [0n] })
+      : account === 'dispatched'
+        ? encodeFunctionData({ abi: executeAbi, functionName: 'verify', args: ['0x'] })
+        : '0x'
+  return { mode: MODE.VERIFY, flags: SCOPE_EXECUTION_AND_PAYMENT, target: null, value: 0n, data: data ?? fallback, label: 'verify' }
+}
+
+export function executeFrame(sender: Address, calls: Call[], mode: Hex = EXEC_MODE.BATCH, label = `execute(${calls.length})`): FrameSpec {
+  const executions = encodeAbiParameters(executionsParams, [calls.map((c) => ({ target: c.to, value: c.value ?? 0n, callData: c.data }))])
   return {
-    mode: MODE.VERIFY,
-    flags: SCOPE_EXECUTION_AND_PAYMENT,
-    target: null,
+    mode: MODE.SENDER,
+    flags: 0,
+    target: sender,
     value: 0n,
-    data: account === 'zeroallow' ? encodeFunctionData({ abi: accountAbi, functionName: 'validate', args: [0n] }) : '0x',
-    label: 'verify',
+    data: encodeFunctionData({ abi: executeAbi, functionName: 'execute', args: [mode, executions] }),
+    label,
   }
 }
 
@@ -145,6 +161,17 @@ function bracket(input: CompileInput) {
     if (isGrant(c) || (c.kind === KIND.APPROVE && quirk.nft)) grants.set(keyOf(c, !!quirk.nft), c)
   })
 
+  for (const call of input.calls) {
+    const u = decodeUr(call.data)
+    if (!u) continue
+    for (const p of nestedPermits(u)) {
+      const c: Classified = { kind: KIND.PERMIT2, token: p.token, spender: p.spender, id: 0n }
+      if (!input.permit2) throw new Error(`call to ${call.to} grants a Permit2 allowance; pass the Permit2 address so it can be revoked`)
+      if (!grants.has(keyOf(c, false))) grants.set(keyOf(c, false), c)
+      notes.push(`revoking the Permit2 allowance a router command grants to ${p.spender} on ${p.token}`)
+    }
+  }
+
   for (const c of grants.values()) {
     const quirk = quirks[lc(c.token)] ?? {}
     body.push({ ...revokeFor(c, quirk, input.sender, input.permit2), label: 'revoke' })
@@ -162,9 +189,8 @@ export function compile(input: CompileInput & { keys?: SealKey[] }): Compiled {
   const { body, grants, keys: derived, notes, sealed } = bracket(input)
   const seen = new Set(derived.map(keyId))
   const extra = (input.keys ?? []).filter((k) => !seen.has(keyId(k)))
-  if (!sealed && !extra.length) {
-    return { frames: [verifyFrame(input.account), ...body.map((s, i) => frame(s, i < body.length - 1))], grants, keys: derived, notes }
-  }
+  const keys = [...derived, ...extra]
+  const verify = verifyFrame(input.account, input.verifyData)
   const steps: Step[] = [...body]
   if (extra.length) {
     steps.push({ to: input.seal, data: encodeFunctionData({ abi: sealAbi, functionName: 'check', args: [extra, []] }), label: 'seal.check' })
@@ -174,7 +200,13 @@ export function compile(input: CompileInput & { keys?: SealKey[] }): Compiled {
     data: encodeFunctionData({ abi: sealAbi, functionName: 'checkFrames', args: [input.minOut ?? []] }),
     label: 'seal.checkFrames',
   }
-  return { frames: [verifyFrame(input.account), ...steps.map((s) => frame(s, true)), frame(closer, false)], grants, keys: [...derived, ...extra], notes }
+  const closed = sealed || extra.length > 0
+  if (input.account === 'dispatched') {
+    const xs = closed ? [...steps, closer] : steps
+    return { frames: [verify, executeFrame(input.sender, xs)], grants, keys, notes }
+  }
+  if (!closed) return { frames: [verify, ...body.map((s, i) => frame(s, i < body.length - 1))], grants, keys, notes }
+  return { frames: [verify, ...steps.map((s) => frame(s, true)), frame(closer, false)], grants, keys, notes }
 }
 
 export function compileCalls(input: Omit<CompileInput, 'account'> & { keys?: SealKey[] }): CompiledCalls {
@@ -193,7 +225,11 @@ export function compileCalls(input: Omit<CompileInput, 'account'> & { keys?: Sea
   return { calls, grants, keys, notes }
 }
 
-export function specExample(p: { calls: Call[]; account?: AccountKind }): FrameSpec[] {
+export function specExample(p: { calls: Call[]; account?: AccountKind; sender?: Address }): FrameSpec[] {
+  if (p.account === 'dispatched') {
+    if (!p.sender) throw new Error('dispatched accounts need the sender address')
+    return [verifyFrame(p.account), executeFrame(p.sender, p.calls)]
+  }
   const body = p.calls.map((call, n) => frame({ ...call, label: `call ${n}` }, n < p.calls.length - 1))
   return [verifyFrame(p.account), ...body]
 }

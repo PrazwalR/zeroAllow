@@ -1,12 +1,12 @@
-import { parseAbi } from 'viem'
+import { parseAbi, parseAbiParameters, type Hex } from 'viem'
 
-export const CREATE2_DEPLOYER = '0x4e59b44847b379578588920ca78fbf26c0b4956c'
-export const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+export const CREATE2_DEPLOYER = '0x4e59b44847b379578588920ca78fbf26c0b4956c' as const
+export const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as const
 export const CANONICAL = {
-  frameOps: '0x22679371820E523224cfBA585535EDA1d26fE6C1',
-  seal: '0xfC483f5Bade6Da527BF04CAC05195BA04CAf5560',
-  swapper: '0x19265c4a23d0F4c1A5eB1aC7fE9B935cF18FfAe9',
-  policy: '0xbcF16943adAf0007854d245073775144E2e17dA7',
+  frameOps: '0x726c4A879937d11F89c6cF533Ab16a9cc90CA484',
+  seal: '0xB6E016304f214caeD1f882f2c8C0A2786900D96E',
+  swapper: '0x6d08f9De8EB5980fC9a8Eb474ef407480918523f',
+  policy: '0x033320bfE2F97fDfa0B7c693A5e6de66E1F2f576',
 } as const
 
 export const MODE = { DEFAULT: 0, VERIFY: 1, SENDER: 2 } as const
@@ -82,7 +82,23 @@ export const SEL = {
   permit2PermitSingle: '0x2b67b570',
   permit2PermitBatch: '0x2a2d80d1',
   checkFrames: '0x1135b925',
+  execute7579: '0xe9ae5c53',
 } as const
+
+export const EXEC_MODE = {
+  BATCH: `0x01${'00'.repeat(31)}` as Hex,
+  BATCH_TRY: `0x0101${'00'.repeat(30)}` as Hex,
+  SINGLE: `0x${'00'.repeat(32)}` as Hex,
+  DELEGATECALL: `0xff${'00'.repeat(31)}` as Hex,
+}
+
+export const executeAbi = parseAbi([
+  'function execute(bytes32 mode, bytes executionCalldata) payable',
+  'function verify(bytes data) returns (uint8)',
+  'function executionRoute() view returns (uint8)',
+])
+
+export const executionsParams = parseAbiParameters('(address target, uint256 value, bytes callData)[]')
 
 export const erc20Abi = parseAbi([
   'function approve(address spender, uint256 amount) returns (bool)',

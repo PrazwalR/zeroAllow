@@ -41,6 +41,16 @@ object "FrameOps" {
             case 4 {
                 verbatim_3i_0o(hex"aa", 0, 0, calldataload(0x20))
             }
+            case 5 {
+                let i := calldataload(0x20)
+                let len := verbatim_2i_1o(hex"b3", i, 0x04)
+                mstore(0x00, verbatim_2i_1o(hex"b3", i, 0x00))
+                mstore(0x20, verbatim_2i_1o(hex"b3", i, 0x02))
+                mstore(0x40, 0x60)
+                mstore(0x60, len)
+                verbatim_4i_0o(hex"b2", 0x80, 0, len, i)
+                return(0x00, add(0x80, and(add(len, 31), not(31))))
+            }
             default {
                 revert(0, 0)
             }

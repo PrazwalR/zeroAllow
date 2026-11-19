@@ -432,3 +432,413 @@ contract PolicyAccount {
 
     receive() external payable {}
 }
+
+interface IV3CallbackLike {
+    function uniswapV3SwapCallback(int256 d0, int256 d1, bytes calldata data) external;
+}
+
+interface IFrameValidatorLike {
+    function validateFrame(bytes calldata data) external view returns (uint8);
+}
+
+contract MockPermit2 {
+    struct Allowance {
+        uint160 amount;
+        uint48 expiration;
+        uint48 nonce;
+    }
+
+    mapping(address => mapping(address => mapping(address => Allowance))) internal allowances;
+
+    event Approval(address indexed owner, address indexed token, address indexed spender, uint160 amount, uint48 expiration);
+
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external {
+        Allowance storage a = allowances[msg.sender][token][spender];
+        a.amount = amount;
+        a.expiration = expiration == 0 ? uint48(block.timestamp) : expiration;
+        emit Approval(msg.sender, token, spender, amount, a.expiration);
+    }
+
+    function allowance(address owner, address token, address spender) external view returns (uint160, uint48, uint48) {
+        Allowance memory a = allowances[owner][token][spender];
+        return (a.amount, a.expiration, a.nonce);
+    }
+
+    function transferFrom(address from, address to, uint160 amount, address token) external {
+        Allowance storage a = allowances[from][token][msg.sender];
+        require(block.timestamp <= a.expiration, "expired");
+        if (a.amount != type(uint160).max) {
+            require(a.amount >= amount, "insufficient");
+            a.amount -= amount;
+        }
+        MockERC20(token).transferFrom(from, to, amount);
+    }
+}
+
+contract MockV3Pool {
+    address public immutable token0;
+    address public immutable token1;
+    uint24 public immutable fee;
+
+    constructor(address a, address b, uint24 f) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        fee = f;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        require(amountSpecified != 0, "AS");
+        (address tIn, address tOut) = zeroForOne ? (token0, token1) : (token1, token0);
+        uint256 rIn = MockERC20(tIn).balanceOf(address(this));
+        uint256 rOut = MockERC20(tOut).balanceOf(address(this));
+        uint256 amtIn;
+        uint256 amtOut;
+        if (amountSpecified > 0) {
+            amtIn = uint256(amountSpecified);
+            uint256 net = (amtIn * (1e6 - fee)) / 1e6;
+            amtOut = (net * rOut) / (rIn + net);
+        } else {
+            amtOut = uint256(-amountSpecified);
+            require(amtOut < rOut, "liquidity");
+            amtIn = (rIn * amtOut * 1e6) / ((rOut - amtOut) * (1e6 - fee)) + 1;
+        }
+        (amount0, amount1) = zeroForOne ? (int256(amtIn), -int256(amtOut)) : (-int256(amtOut), int256(amtIn));
+        MockERC20(tOut).transfer(recipient, amtOut);
+        IV3CallbackLike(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+        require(MockERC20(tIn).balanceOf(address(this)) >= rIn + amtIn, "IIA");
+    }
+}
+
+contract MockV3Factory {
+    mapping(address => mapping(address => mapping(uint24 => address))) public getPool;
+
+    function createPool(address a, address b, uint24 fee) external returns (address pool) {
+        require(getPool[a][b][fee] == address(0), "exists");
+        pool = address(new MockV3Pool(a, b, fee));
+        getPool[a][b][fee] = pool;
+        getPool[b][a][fee] = pool;
+    }
+}
+
+abstract contract V3Payer {
+    address transient payer_;
+    address transient pool_;
+
+    function _v3Hop(address factory, address a, address b, uint24 fee, uint256 amountIn, address recipient, address payer)
+        internal
+        returns (uint256)
+    {
+        address pool = MockV3Factory(factory).getPool(a, b, fee);
+        require(pool != address(0), "pool");
+        payer_ = payer;
+        pool_ = pool;
+        bool z = a < b;
+        (int256 d0, int256 d1) = MockV3Pool(pool).swap(
+            recipient, z, int256(amountIn), z ? 4295128740 : 1461446703485210103287273052203988822378723970341, abi.encode(a)
+        );
+        pool_ = address(0);
+        return uint256(-(z ? d1 : d0));
+    }
+
+    function uniswapV3SwapCallback(int256 d0, int256 d1, bytes calldata data) external {
+        require(msg.sender == pool_ && msg.sender != address(0), "pool");
+        _pay(abi.decode(data, (address)), payer_, msg.sender, d0 > 0 ? uint256(d0) : uint256(d1));
+    }
+
+    function _pay(address token, address payer, address to, uint256 amount) internal virtual;
+
+    function multicall(address target, bytes calldata data) external returns (bytes memory r) {
+        bool ok;
+        (ok, r) = target.call(data);
+        require(ok, "call");
+    }
+}
+
+contract MockV3Router is V3Payer {
+    address public immutable factory;
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    constructor(address f) {
+        factory = f;
+    }
+
+    function multicall(uint256 deadline, bytes[] calldata data) external payable returns (bytes[] memory results) {
+        require(block.timestamp <= deadline, "Transaction too old");
+        results = new bytes[](data.length);
+        for (uint256 i; i < data.length; ++i) {
+            (bool ok, bytes memory r) = address(this).delegatecall(data[i]);
+            if (!ok) {
+                assembly {
+                    revert(add(r, 0x20), mload(r))
+                }
+            }
+            results[i] = r;
+        }
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata p) external payable returns (uint256 out) {
+        out = _v3Hop(factory, p.tokenIn, p.tokenOut, p.fee, p.amountIn, _to(p.recipient), msg.sender);
+        require(out >= p.amountOutMinimum, "Too little received");
+    }
+
+    function exactInput(ExactInputParams calldata p) external payable returns (uint256 out) {
+        bytes calldata path = p.path;
+        uint256 hops = (path.length - 20) / 23;
+        out = p.amountIn;
+        address payer = msg.sender;
+        for (uint256 i; i < hops; ++i) {
+            uint256 o = i * 23;
+            out = _v3Hop(
+                factory,
+                address(bytes20(path[o:o + 20])),
+                address(bytes20(path[o + 23:o + 43])),
+                uint24(bytes3(path[o + 20:o + 23])),
+                out,
+                i + 1 == hops ? _to(p.recipient) : address(this),
+                payer
+            );
+            payer = address(this);
+        }
+        require(out >= p.amountOutMinimum, "Too little received");
+    }
+
+    function _to(address r) internal view returns (address) {
+        return r == address(1) ? msg.sender : r == address(2) ? address(this) : r;
+    }
+
+    function _pay(address token, address payer, address to, uint256 amount) internal override {
+        if (payer == address(this)) MockERC20(token).transfer(to, amount);
+        else MockERC20(token).transferFrom(payer, to, amount);
+    }
+}
+
+contract MockUniversalRouter is V3Payer {
+    uint256 internal constant CONTRACT_BALANCE = 1 << 255;
+
+    address public immutable permit2;
+    address public immutable v2Factory;
+    address public immutable v3Factory;
+    address transient locker_;
+
+    constructor(address p2, address f2, address f3) {
+        permit2 = p2;
+        v2Factory = f2;
+        v3Factory = f3;
+    }
+
+    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable {
+        require(block.timestamp <= deadline, "deadline");
+        _execute(commands, inputs);
+    }
+
+    function execute(bytes calldata commands, bytes[] calldata inputs) external payable {
+        _execute(commands, inputs);
+    }
+
+    function _execute(bytes calldata commands, bytes[] calldata inputs) internal {
+        require(locker_ == address(0), "locked");
+        require(commands.length == inputs.length, "length");
+        locker_ = msg.sender;
+        for (uint256 i; i < commands.length; ++i) {
+            _dispatch(uint8(commands[i]) & 0x7f, inputs[i]);
+        }
+        locker_ = address(0);
+    }
+
+    function _dispatch(uint256 cmd, bytes calldata input) internal {
+        if (cmd == 0x00) {
+            (address recipient, uint256 amountIn, uint256 minOut, bytes memory path, bool payerIsUser) =
+                abi.decode(input, (address, uint256, uint256, bytes, bool));
+            address payer = payerIsUser ? locker_ : address(this);
+            if (amountIn == CONTRACT_BALANCE) amountIn = MockERC20(_addr(path, 0)).balanceOf(address(this));
+            uint256 hops = (path.length - 20) / 23;
+            for (uint256 i; i < hops; ++i) {
+                uint256 o = i * 23;
+                amountIn = _v3Hop(
+                    v3Factory,
+                    _addr(path, o),
+                    _addr(path, o + 23),
+                    _fee(path, o + 20),
+                    amountIn,
+                    i + 1 == hops ? _map(recipient) : address(this),
+                    payer
+                );
+                payer = address(this);
+            }
+            require(amountIn >= minOut, "V3TooLittleReceived");
+        } else if (cmd == 0x04) {
+            (address token, address recipient, uint256 amountMin) = abi.decode(input, (address, address, uint256));
+            uint256 b = MockERC20(token).balanceOf(address(this));
+            require(b >= amountMin, "InsufficientToken");
+            if (b > 0) MockERC20(token).transfer(_map(recipient), b);
+        } else if (cmd == 0x08 || cmd == 0x09) {
+            (address recipient, uint256 amount, uint256 limit, address[] memory path, bool payerIsUser) =
+                abi.decode(input, (address, uint256, uint256, address[], bool));
+            address payer = payerIsUser ? locker_ : address(this);
+            address to = _map(recipient);
+            address pair0 = MockV2Factory(v2Factory).getPair(path[0], path[1]);
+            uint256 before = MockERC20(path[path.length - 1]).balanceOf(to);
+            if (cmd == 0x08) {
+                if (amount == CONTRACT_BALANCE) amount = MockERC20(path[0]).balanceOf(address(this));
+                if (amount != 0) _pay(path[0], payer, pair0, amount);
+                _v2(path, to);
+                require(MockERC20(path[path.length - 1]).balanceOf(to) - before >= limit, "V2TooLittleReceived");
+            } else {
+                uint256 amountIn = _amountIn(path, amount);
+                require(amountIn <= limit, "V2TooMuchRequested");
+                _pay(path[0], payer, pair0, amountIn);
+                _v2(path, to);
+            }
+        } else {
+            revert("command");
+        }
+    }
+
+    function _amountIn(address[] memory path, uint256 amountOut) internal view returns (uint256 a) {
+        a = amountOut;
+        for (uint256 i = path.length - 1; i > 0; --i) {
+            MockV2Pair pair = MockV2Pair(MockV2Factory(v2Factory).getPair(path[i - 1], path[i]));
+            (uint256 r0, uint256 r1,) = pair.getReserves();
+            (uint256 rIn, uint256 rOut) = path[i - 1] == pair.token0() ? (r0, r1) : (r1, r0);
+            a = (rIn * a * 1000) / ((rOut - a) * 997) + 1;
+        }
+    }
+
+    function _v2(address[] memory path, address to) internal {
+        for (uint256 i; i + 1 < path.length; ++i) {
+            MockV2Pair pair = MockV2Pair(MockV2Factory(v2Factory).getPair(path[i], path[i + 1]));
+            (uint256 r0, uint256 r1,) = pair.getReserves();
+            bool zero = path[i] == pair.token0();
+            (uint256 rIn, uint256 rOut) = zero ? (r0, r1) : (r1, r0);
+            uint256 inAmt = MockERC20(path[i]).balanceOf(address(pair)) - rIn;
+            uint256 out = (inAmt * 997 * rOut) / (rIn * 1000 + inAmt * 997);
+            address next = i + 2 < path.length ? MockV2Factory(v2Factory).getPair(path[i + 1], path[i + 2]) : to;
+            pair.swap(zero ? 0 : out, zero ? out : 0, next, "");
+        }
+    }
+
+    function _pay(address token, address payer, address to, uint256 amount) internal override {
+        if (payer == address(this)) MockERC20(token).transfer(to, amount);
+        else MockPermit2(permit2).transferFrom(payer, to, uint160(amount), token);
+    }
+
+    function _map(address r) internal view returns (address) {
+        return r == address(1) ? locker_ : r == address(2) ? address(this) : r;
+    }
+
+    function _addr(bytes memory p, uint256 o) internal pure returns (address a) {
+        assembly {
+            a := shr(96, mload(add(add(p, 0x20), o)))
+        }
+    }
+
+    function _fee(bytes memory p, uint256 o) internal pure returns (uint24 f) {
+        assembly {
+            f := shr(232, mload(add(add(p, 0x20), o)))
+        }
+    }
+}
+
+contract Dispatch7579Account {
+    address internal constant ENTRY_POINT = address(0xaa);
+
+    struct Execution {
+        address target;
+        uint256 value;
+        bytes callData;
+    }
+
+    address public immutable owner;
+    address public immutable ops;
+    address public immutable policy;
+
+    constructor(address owner_, address ops_, address policy_) {
+        owner = owner_;
+        ops = ops_;
+        policy = policy_;
+    }
+
+    function verify(bytes calldata) external returns (uint8 approved) {
+        require(msg.sender == ENTRY_POINT, "entry point");
+        (address sender, uint256 n, uint256 cur,) = abi.decode(_op(1, 0), (address, uint256, uint256, uint256));
+        (address signer, uint256 scheme, bytes32 m) = abi.decode(_op(3, 0), (address, uint256, bytes32));
+        require(sender == address(this) && scheme == 1 && signer == owner && m == bytes32(0), "sig");
+        bytes memory blob = _op(2, 0);
+        require(_word(blob, cur, 1) == 1, "verify");
+        approved = IFrameValidatorLike(policy).validateFrame("") & uint8(_word(blob, cur, 2) & 3);
+        for (uint256 i; i < n; ++i) {
+            if (_word(blob, i, 1) == 2 && _word(blob, i, 0) != uint160(address(this))) approved &= 1;
+        }
+        require(approved == 3, "rejected");
+        _op(4, approved);
+    }
+
+    function execute(bytes32 mode, bytes calldata ec) external payable {
+        require(msg.sender == address(this), "self");
+        bool tryMode = mode[1] == 0x01;
+        require(mode[1] == 0x00 || tryMode, "execType");
+        if (mode[0] == 0x00) {
+            _call(address(bytes20(ec[0:20])), uint256(bytes32(ec[20:52])), ec[52:], tryMode);
+        } else if (mode[0] == 0x01) {
+            Execution[] memory xs = abi.decode(ec, (Execution[]));
+            for (uint256 i; i < xs.length; ++i) {
+                _call(xs[i].target, xs[i].value, xs[i].callData, tryMode);
+            }
+        } else {
+            revert("callType");
+        }
+    }
+
+    function executionRoute() external pure returns (uint8) {
+        return 1;
+    }
+
+    function supportsExecutionMode(bytes32 mode) external pure returns (bool) {
+        return uint8(mode[0]) <= 1 && uint8(mode[1]) <= 1;
+    }
+
+    function supportsApprovalMode(uint8 mode) external pure returns (bool) {
+        return mode == 3;
+    }
+
+    function _call(address target, uint256 value, bytes memory data, bool tryMode) internal {
+        (bool ok, bytes memory r) = target.call{value: value}(data);
+        if (!ok && !tryMode) {
+            assembly {
+                revert(add(r, 0x20), mload(r))
+            }
+        }
+    }
+
+    function _word(bytes memory blob, uint256 i, uint256 w) internal pure returns (uint256 v) {
+        assembly {
+            v := mload(add(add(blob, 0x40), add(mul(i, 0x180), shl(5, w))))
+        }
+    }
+
+    function _op(uint256 op, uint256 a) internal returns (bytes memory r) {
+        bool ok;
+        (ok, r) = ops.delegatecall(abi.encode(op, a));
+        require(ok, "op");
+    }
+
+    receive() external payable {}
+}

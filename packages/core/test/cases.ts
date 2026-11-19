@@ -1,8 +1,8 @@
-import { encodeFunctionData, maxUint256, parseAbi, type Address, type Hex } from 'viem'
-import { ATOMIC, CODE, MODE, compile, delegationAbi, e6909Abi, erc20Abi, nftAbi, sealAbi, specExample, verifyFrame, type FrameSpec } from '../src/index.js'
+import { concatHex, encodeFunctionData, getAddress, maxUint256, padHex, parseAbi, type Address, type Hex } from 'viem'
+import { ATOMIC, CODE, EXEC_MODE, MODE, compile, delegationAbi, e6909Abi, erc20Abi, executeAbi, executeFrame, nftAbi, sealAbi, specExample, verifyFrame, type Call, type FrameSpec } from '../src/index.js'
 
 export const S: Address = '0x1111111111111111111111111111111111111111'
-export const SEAL: Address = '0x5EA15EA15ea15ea15ea15ea15Ea15eA15eA15ea1'
+export const SEAL: Address = getAddress('0x5ea15ea15ea15ea15ea15ea15ea15ea15ea15ea1')
 export const R: Address = '0x2222222222222222222222222222222222222222'
 export const T: Address = '0x3333333333333333333333333333333333333333'
 export const P2: Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
@@ -54,7 +54,21 @@ const stress: FrameSpec[] = [v]
 for (let i = 0; i < 31; i++) stress.push(f(T, approve(R, 1n), true), f(T, approve(R, 0n), true))
 stress.push(closer())
 
-export type Case = { name: string; frames: FrameSpec[]; code: number; at: number; permit2?: Address }
+const dv = verifyFrame('dispatched')
+const ex = (calls: Call[], mode: Hex = EXEC_MODE.BATCH) => executeFrame(S, calls, mode)
+const sealCall: Call = { to: SEAL, data: encodeFunctionData({ abi: sealAbi, functionName: 'checkFrames', args: [[]] }) }
+const dBracket: Call[] = [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }, { to: T, data: approve(R, 0n) }, sealCall]
+const single = (to: Address, data: Hex): FrameSpec => ({
+  mode: MODE.SENDER,
+  flags: 0,
+  target: S,
+  value: 0n,
+  data: encodeFunctionData({ abi: executeAbi, functionName: 'execute', args: [EXEC_MODE.SINGLE, concatHex([to, padHex('0x0', { size: 32 }), data])] }),
+  label: '',
+})
+const truncated = ex(dBracket)
+
+export type Case = { name: string; frames: FrameSpec[]; code: number; at: number; permit2?: Address; dispatch?: boolean }
 
 export const cases: Case[] = [
   { name: 'compiled bracket', frames: bracket, code: CODE.OK, at: 0 },
@@ -82,4 +96,16 @@ export const cases: Case[] = [
   { name: 'relayer for another sender', frames: [v, f(T, encodeFunctionData({ abi: delegationAbi, functionName: 'setRelayerApproval', args: [R, R, true] }), true), f(R, swap(1n), false)], code: CODE.OK, at: 0 },
   { name: 'short relayer approval', frames: [v, f(T, delegations[3].slice(0, 138) as Hex, true), closer()], code: CODE.UNPARSEABLE, at: 1 },
   { name: 'short erc777 operator', frames: [v, f(T, delegations[4].slice(0, 40) as Hex, true), closer()], code: CODE.UNPARSEABLE, at: 1 },
+  { name: 'dispatched compiled bracket', frames: compile({ sender: S, seal: SEAL, account: 'dispatched', calls: [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }] }).frames, code: CODE.OK, at: 0, dispatch: true },
+  { name: 'dispatched spec example 2', frames: specExample({ account: 'dispatched', sender: S, calls: [{ to: T, data: approve(R, maxUint256) }, { to: R, data: swap(1n) }] }), code: CODE.UNSEALED, at: 1, dispatch: true },
+  { name: 'dispatched try mode', frames: [dv, ex(dBracket, EXEC_MODE.BATCH_TRY)], code: CODE.OUTSIDE_BATCH, at: 1, dispatch: true },
+  { name: 'dispatched single grant', frames: [dv, single(T, approve(R, 5n))], code: CODE.OUTSIDE_BATCH, at: 1, dispatch: true },
+  { name: 'dispatched single neutral', frames: [dv, single(R, swap(5n))], code: CODE.OK, at: 0, dispatch: true },
+  { name: 'dispatched delegatecall', frames: [dv, ex(dBracket, EXEC_MODE.DELEGATECALL)], code: CODE.SELF_CALL, at: 1, dispatch: true },
+  { name: 'dispatched nested self', frames: [dv, ex([{ to: T, data: approve(R, 1n) }, { to: S, data: '0xe9ae5c53' }, sealCall])], code: CODE.SELF_CALL, at: 1, dispatch: true },
+  { name: 'dispatched truncated', frames: [dv, { ...truncated, data: truncated.data.slice(0, -80) as Hex }], code: CODE.UNPARSEABLE, at: 1, dispatch: true },
+  { name: 'dispatched grant after seal', frames: [dv, ex([{ to: T, data: approve(R, 1n) }, sealCall, { to: T, data: approve(R, 0n) }])], code: CODE.UNSEALED, at: 1, dispatch: true },
+  { name: 'dispatched two seals', frames: [dv, ex([{ to: T, data: approve(R, 1n) }, { to: T, data: approve(R, 0n) }, sealCall, { to: T, data: approve(P2, 7n) }, sealCall])], code: CODE.OK, at: 0, dispatch: true },
+  { name: 'dispatched then unsealed frame grant', frames: [dv, ex(dBracket), f(T, approve(R, 1n), true), f(R, swap(1n), false)], code: CODE.UNSEALED, at: 2, dispatch: true },
+  { name: 'execute frame without dispatch support', frames: [dv, ex(dBracket)], code: CODE.SELF_CALL, at: 1 },
 ]

@@ -40,9 +40,10 @@ options
   --seal <addr>         ZeroAllowSeal address (default ${CANONICAL.seal})
   --calls <file>        JSON array of { to, data, value? }
   --frames <file>       JSON frame list (check only)
-  --account <kind>      eoa | zeroallow (default eoa)
+  --account <kind>      eoa | zeroallow | dispatched (ERC-7579 account that routes every call through execute) (default eoa)
   --mode <mode>         frame | 5792 (default frame)
-  --strategy <s>        bracket | direct (default bracket); direct sends V2 router swaps straight to the pairs, no approval
+  --strategy <s>        bracket | direct (default bracket); direct reroutes V2/V3 router and Universal Router swaps so nothing is approved
+  --verify-data <hex>   calldata for the account's VERIFY frame (third-party accounts); default per --account
   --swapper <addr>      ZeroAllowSwapper address (default ${CANONICAL.swapper})
   --permit2 <addr>      Permit2 address (default canonical ${PERMIT2})
   --min-out <tok:amt>   require output delta, repeatable
@@ -63,6 +64,7 @@ const { positionals, values } = parseArgs({
     account: { type: 'string', default: 'eoa' },
     mode: { type: 'string', default: 'frame' },
     strategy: { type: 'string', default: 'bracket' },
+    'verify-data': { type: 'string' },
     swapper: { type: 'string' },
     permit2: { type: 'string' },
     'min-out': { type: 'string', multiple: true },
@@ -93,6 +95,7 @@ const readJson = (f: string) => JSON.parse(readFileSync(f, 'utf8'))
 const seal = getAddress(values.seal ?? CANONICAL.seal)
 const permit2 = getAddress(values.permit2 ?? PERMIT2)
 const account = values.account as AccountKind
+const verifyData = values['verify-data'] as Hex | undefined
 const needClient = () => {
   if (!client) throw new Error(`${cmd} needs --rpc or ZEROALLOW_RPC`)
   return client
@@ -103,7 +106,7 @@ function printFrames(frames: FrameSpec[], sender: Address) {
   frames.forEach((f, i) =>
     console.log(`${String(i).padStart(3)}  ${mode[f.mode].padEnd(7)} ${f.flags & 4 ? 'atomic' : '      '}  ${(f.target ?? 'sender').padEnd(42)}  ${f.label}`),
   )
-  const v = guard(frames, sender, seal, permit2)
+  const v = guard(frames, sender, seal, permit2, account === 'dispatched')
   console.log(`\nguard: ${v.code === CODE.OK ? 'accept' : `refuse at frame ${v.at}: ${v.reason}`}`)
 }
 
@@ -118,6 +121,7 @@ async function build() {
     seal,
     calls: (readJson(need('calls')) as Call[]).map((c) => ({ to: getAddress(c.to), data: c.data as Hex, value: c.value ? BigInt(c.value) : 0n })),
     account,
+    verifyData,
     permit2,
     minOut: (values['min-out'] ?? []).map((s: string) => {
       const [token, amount] = s.split(':')
@@ -181,7 +185,7 @@ if (cmd === 'compile') {
   const frames = (readJson(need('frames')) as FrameSpec[]).map((f) => ({ ...f, value: BigInt(f.value) }))
   const sender = getAddress(need('sender'))
   printFrames(frames, sender)
-  process.exit(guard(frames, sender, seal, permit2).code === CODE.OK ? 0 : 2)
+  process.exit(guard(frames, sender, seal, permit2, account === 'dispatched').code === CODE.OK ? 0 : 2)
 } else if (cmd === 'send') {
   const { input, prepared } = await build()
   const out = compile(prepared)
@@ -204,10 +208,11 @@ if (cmd === 'compile') {
     process.exit(0)
   }
   let ok = true
-  for (let i = 0; i < found.length; i += 61) {
-    const part = found.slice(i, i + 61)
-    const { frames } = compile({ sender: owner, seal, permit2, account, calls: revokeCalls(part, owner, permit2), keys: revokeKeys(part) })
-    console.log(`\nrevoke batch ${i / 61 + 1}: ${part.length} grants`)
+  const chunk = account === 'dispatched' ? 40 : 61
+  for (let i = 0; i < found.length; i += chunk) {
+    const part = found.slice(i, i + chunk)
+    const { frames } = compile({ sender: owner, seal, permit2, account, verifyData, calls: revokeCalls(part, owner, permit2), keys: revokeKeys(part) })
+    console.log(`\nrevoke batch ${i / chunk + 1}: ${part.length} grants`)
     printFrames(frames, owner)
     if (values.send || values['dry-run']) ok = (await sendFrames(owner, frames)) && ok
   }

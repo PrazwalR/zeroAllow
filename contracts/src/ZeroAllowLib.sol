@@ -28,6 +28,7 @@ library ZeroAllowLib {
     uint256 internal constant UNSEALED = 4;
 
     bytes4 internal constant CHECK_FRAMES = 0x1135b925;
+    bytes4 internal constant EXECUTE = 0xe9ae5c53;
     uint256 internal constant FIRST_BYTES = 0x400400000a004010000000400208080000000000020000402020c0000020200;
 
     struct Key {
@@ -290,6 +291,128 @@ library ZeroAllowLib {
                 }
                 if and(iszero(iszero(need)), lt(len, add(4, shl(5, need)))) { r := MALFORMED }
             }
+        }
+    }
+
+    function guard(bytes memory blob, bytes[] memory full, address sender, address seal, address permit2)
+        internal
+        pure
+        returns (uint256 code, uint256 at)
+    {
+        uint256 n = count(blob);
+        for (uint256 i; i < full.length && i < n; ++i) {
+            if (full[i].length == 0 || !dispatched(blob, i, sender)) continue;
+            (uint256 c, bytes memory vb) = virtualBlob(full[i]);
+            if (c == OK) (c,) = guard(vb, sender, seal, permit2);
+            if (c != OK) return (c, i);
+            assembly {
+                mstore(add(add(blob, 0x60), mul(i, 0x180)), 0)
+            }
+        }
+        return guard(blob, sender, seal, permit2);
+    }
+
+    function dispatched(bytes memory blob, uint256 i, address sender) internal pure returns (bool) {
+        return word(blob, i, 1) == MODE_SENDER && word(blob, i, 0) == uint160(sender) && word(blob, i, 4) >= 4
+            && selector(blob, i) == EXECUTE;
+    }
+
+    function virtualBlob(bytes memory d) internal pure returns (uint256 code, bytes memory vb) {
+        uint256 len = d.length;
+        if (len < 0x64) return (UNPARSEABLE, vb);
+        uint256 mode = _at(d, 4);
+        uint256 callType = mode >> 248;
+        uint256 execType = (mode >> 240) & 0xff;
+        if (callType > 1 || execType > 1) return (SELF_CALL, vb);
+        uint256 off = _at(d, 0x24);
+        if (off > len - 0x24) return (UNPARSEABLE, vb);
+        uint256 ec = 4 + off + 32;
+        uint256 ecLen = _at(d, 4 + off);
+        if (ecLen > len - ec) return (UNPARSEABLE, vb);
+        uint256 end = ec + ecLen;
+        if (callType == 0) {
+            if (ecLen < 52) return (UNPARSEABLE, vb);
+            vb = new bytes(32 + STRIDE);
+            _put(vb, 0, _at(d, ec) >> 96, 0, _at(d, ec + 20), d, ec + 52, ecLen - 52);
+            _setCount(vb, 1);
+            return (OK, vb);
+        }
+        if (ecLen < 32) return (UNPARSEABLE, vb);
+        uint256 aOff = _at(d, ec);
+        if (aOff > ecLen - 32) return (UNPARSEABLE, vb);
+        uint256 heads = ec + aOff + 32;
+        uint256 n = _at(d, heads - 32);
+        if (n > (end - heads) / 32) return (UNPARSEABLE, vb);
+        vb = new bytes(32 + n * STRIDE);
+        uint256 bad;
+        assembly {
+            let base := add(d, 0x20)
+            let out := add(vb, 0x40)
+            let room := sub(end, heads)
+            for { let k := 0 } lt(k, n) { k := add(k, 1) } {
+                let tOff := mload(add(base, add(heads, shl(5, k))))
+                if or(gt(tOff, room), lt(sub(room, tOff), 96)) {
+                    bad := 1
+                    break
+                }
+                let t := add(heads, tOff)
+                let cOff := mload(add(base, add(t, 64)))
+                if or(gt(cOff, sub(end, t)), lt(sub(sub(end, t), cOff), 32)) {
+                    bad := 1
+                    break
+                }
+                let c := add(t, cOff)
+                let cLen := mload(add(base, c))
+                if gt(cLen, sub(sub(end, c), 32)) {
+                    bad := 1
+                    break
+                }
+                let p := add(out, mul(k, 0x180))
+                mstore(p, and(mload(add(base, t)), 0xffffffffffffffffffffffffffffffffffffffff))
+                mstore(add(p, 0x20), MODE_SENDER)
+                mstore(add(p, 0x40), mul(ATOMIC, and(iszero(execType), lt(add(k, 1), n))))
+                mstore(add(p, 0x60), mload(add(base, add(t, 32))))
+                mstore(add(p, 0x80), cLen)
+                let h := cLen
+                if gt(h, HEAD) { h := HEAD }
+                mcopy(add(p, 0xa0), add(base, add(c, 32)), h)
+            }
+            mstore(add(vb, 0x20), n)
+        }
+        return (bad == 0 ? OK : UNPARSEABLE, vb);
+    }
+
+    function _at(bytes memory d, uint256 b) private pure returns (uint256 v) {
+        assembly {
+            v := mload(add(add(d, 0x20), b))
+        }
+    }
+
+    function _setCount(bytes memory vb, uint256 n) private pure {
+        assembly {
+            mstore(add(vb, 0x20), n)
+        }
+    }
+
+    function _put(
+        bytes memory vb,
+        uint256 k,
+        uint256 target,
+        uint256 flags,
+        uint256 value,
+        bytes memory d,
+        uint256 from,
+        uint256 len
+    ) private pure {
+        uint256 head = len < HEAD ? len : HEAD;
+        assembly {
+            let p := add(add(vb, 0x40), mul(k, 0x180))
+            mstore(p, and(target, 0xffffffffffffffffffffffffffffffffffffffff))
+            mstore(add(p, 0x20), MODE_SENDER)
+            mstore(add(p, 0x40), flags)
+            mstore(add(p, 0x60), value)
+            mstore(add(p, 0x80), len)
+            mcopy(add(p, 0xa0), add(add(d, 0x20), from), head)
         }
     }
 

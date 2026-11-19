@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { decodeFunctionData, encodeDeployData, encodeFunctionData, getContractAddress, maxUint256, type Abi, type Hex } from 'viem'
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeDeployData, encodeFunctionData, getContractAddress, maxUint256, parseAbiParameters, type Abi, type Address, type Client, type Hex } from 'viem'
 import { describe, expect, test } from 'vitest'
-import { ATOMIC, CANONICAL, CODE, CREATE2_DEPLOYER, KIND, MODE, PERMIT2, VERIFY_LIMITS, classify, compile, compileCalls, delegationAbi, erc20Abi, guard, nftAbi, sealAbi, specExample } from '../src/index.js'
+import { ATOMIC, CANONICAL, CMD, CODE, CREATE2_DEPLOYER, KIND, MODE, MSG_SENDER, PERMIT2, VERIFY_LIMITS, decodeUr, encodeUr, executeAbi, executionsParams, permit2Abi, routeDirect, v3Hops, v3Path, classify, compile, compileCalls, delegationAbi, erc20Abi, guard, nftAbi, sealAbi, specExample } from '../src/index.js'
 import { buildVectors } from '../scripts/vectors.js'
 import { P2, R, S, SEAL, T, approve, cases, delegations, swap } from './cases.js'
 
@@ -117,6 +117,88 @@ describe('compile', () => {
   })
 })
 
+const UR: Address = '0x4444444444444444444444444444444444444444'
+const W: Address = '0x5555555555555555555555555555555555555555'
+const v3In = (payerIsUser: boolean, amount: bigint, path: Hex, extra = true) =>
+  extra
+    ? encodeAbiParameters(parseAbiParameters('address, uint256, uint256, bytes, bool, uint256[]'), [MSG_SENDER, amount, 1n, path, payerIsUser, []])
+    : encodeAbiParameters(parseAbiParameters('address, uint256, uint256, bytes, bool'), [MSG_SENDER, amount, 1n, path, payerIsUser])
+const permitIn = encodeAbiParameters(parseAbiParameters('((address, uint160, uint48, uint48), address, uint256), bytes'), [[[T, 5n, 9, 0], UR, 9n], '0x1234'])
+const urCall = (commands: number[], inputs: Hex[], value = 0n) => ({ to: UR, data: encodeUr({ commands, inputs, deadline: 99n }), value })
+const p2Approve = encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [T, UR, (1n << 160n) - 1n, 2 ** 48 - 1] })
+const nobody = {} as Client
+
+describe('universal router direct route', () => {
+  test('payerIsUser flipped in place, permits dropped, input pre-transferred and swept back', async () => {
+    const path = v3Path([{ a: T, fee: 3000, b: W }])
+    const swapIn = v3In(true, 100n, path)
+    const calls = [{ to: T, data: approve(PERMIT2, maxUint256) }, { to: PERMIT2, data: p2Approve }, urCall([CMD.PERMIT2_PERMIT, CMD.V3_SWAP_EXACT_IN], [permitIn, swapIn])]
+    const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls }, { swapper: R })
+    expect(r.calls.map((c) => c.to)).toEqual([T, UR])
+    expect(decodeFunctionData({ abi: erc20Abi, data: r.calls[0].data }).args).toEqual([UR, 100n])
+    const u = decodeUr(r.calls[1].data)!
+    expect(u.commands).toEqual([CMD.V3_SWAP_EXACT_IN, CMD.SWEEP])
+    expect(u.deadline).toBe(99n)
+    expect(u.inputs[0]).toBe(`${swapIn.slice(0, 2 + 64 * 4)}${'0'.repeat(64)}${swapIn.slice(66 + 64 * 4)}`)
+    expect(decodeAbiParameters(parseAbiParameters('address, address, uint256'), u.inputs[1])).toEqual([T, MSG_SENDER, 0n])
+    expect(r.notes.filter((n) => n.includes('dropped'))).toHaveLength(2)
+  })
+
+  test('exact out pulls the max from the last token of the path and sweeps it', async () => {
+    const path = v3Path([{ a: W, fee: 500, b: T }])
+    const out = encodeAbiParameters(parseAbiParameters('address, uint256, uint256, bytes, bool'), [MSG_SENDER, 7n, 300n, path, true])
+    const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [urCall([CMD.V3_SWAP_EXACT_OUT], [out])] }, { swapper: R })
+    expect(r.calls[0]).toMatchObject({ to: T })
+    expect(decodeFunctionData({ abi: erc20Abi, data: r.calls[0].data }).args).toEqual([UR, 300n])
+    expect(decodeUr(r.calls[1].data)!.commands).toEqual([CMD.V3_SWAP_EXACT_OUT, CMD.SWEEP])
+  })
+
+  test('falls back on permit2 pulls, unknown commands, contract-balance amounts and native value', async () => {
+    const path = v3Path([{ a: T, fee: 3000, b: W }])
+    const pull = encodeAbiParameters(parseAbiParameters('address, address, uint160'), [T, UR, 5n])
+    for (const call of [
+      urCall([CMD.PERMIT2_TRANSFER_FROM, CMD.V3_SWAP_EXACT_IN], [pull, v3In(false, 5n, path)]),
+      urCall([0x10], ['0x']),
+      urCall([CMD.V3_SWAP_EXACT_IN], [v3In(true, 1n << 255n, path)]),
+      urCall([CMD.V3_SWAP_EXACT_IN], [v3In(true, 5n, path)], 1n),
+    ]) {
+      const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [{ to: T, data: approve(PERMIT2, 5n) }, call] }, { swapper: R })
+      expect(r.calls).toEqual([{ to: T, data: approve(PERMIT2, 5n) }, call])
+    }
+  })
+
+  test('bracket fallback revokes Permit2 allowances granted inside router commands', () => {
+    const path = v3Path([{ a: T, fee: 3000, b: W }])
+    const ur = urCall([CMD.PERMIT2_PERMIT, 0x10], [permitIn, '0x'])
+    const { frames } = compile({ sender: S, seal: SEAL, permit2: P2, account: 'zeroallow', calls: [{ to: T, data: approve(P2, maxUint256) }, ur] })
+    const revoke = frames.find((f) => f.target === P2 && f.label === 'revoke')!
+    expect(decodeFunctionData({ abi: permit2Abi, data: revoke.data }).args).toEqual([T, UR, 0n, 0])
+    expect(guard(frames, S, SEAL, P2).code).toBe(CODE.OK)
+    expect(() => compile({ sender: S, seal: SEAL, calls: [ur] })).toThrow(/Permit2 address/)
+    expect(v3Hops(path)).toEqual([{ a: T, fee: 3000, b: W }])
+  })
+})
+
+describe('dispatched (ERC-7579) accounts', () => {
+  test('the bracket becomes one revert-all execute batch closed by the seal', () => {
+    const { frames } = compile({ sender: S, seal: SEAL, account: 'dispatched', calls: [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }] })
+    expect(frames).toHaveLength(2)
+    expect(decodeFunctionData({ abi: executeAbi, data: frames[0].data }).functionName).toBe('verify')
+    expect(frames[1]).toMatchObject({ mode: MODE.SENDER, target: S, flags: 0 })
+    const { args } = decodeFunctionData({ abi: executeAbi, data: frames[1].data })
+    expect(args[0]).toBe(`0x01${'00'.repeat(31)}`)
+    const [xs] = decodeAbiParameters(executionsParams, args[1] as Hex)
+    expect(xs.map((x) => x.target)).toEqual([T, R, T, SEAL])
+    expect(guard(frames, S, SEAL, undefined, true).code).toBe(CODE.OK)
+    expect(guard(frames, S, SEAL).code).toBe(CODE.SELF_CALL)
+  })
+
+  test('verifyData overrides the verify call for third-party accounts', () => {
+    const { frames } = compile({ sender: S, seal: SEAL, account: 'dispatched', verifyData: '0xdeadbeef', calls: [{ to: R, data: swap(1n) }] })
+    expect(frames[0].data).toBe('0xdeadbeef')
+  })
+})
+
 describe('compileCalls (erc-5792)', () => {
   test('same bracket closed by seal.check with keys the seal would derive', () => {
     const { calls, keys } = compileCalls({ sender: S, seal: SEAL, calls: [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }] })
@@ -174,7 +256,7 @@ describe.skipIf(!existsSync(out))('canonical deployment', () => {
 
 describe('golden vectors', () => {
   test.each(cases.map((c) => [c.name, c] as const))('%s', (_, c) => {
-    expect(guard(c.frames, S, SEAL, c.permit2)).toMatchObject({ code: c.code, at: c.at })
+    expect(guard(c.frames, S, SEAL, c.permit2, !!c.dispatch)).toMatchObject({ code: c.code, at: c.at })
   })
 
   test('vectors/guard.json is current', () => {

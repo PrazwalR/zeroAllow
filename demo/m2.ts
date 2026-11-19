@@ -2,12 +2,14 @@ import { decodeErrorResult, encodeFunctionData, formatEther, maxUint256, parseAb
 import {
   ATOMIC,
   CODE_NAME,
+  EXEC_MODE,
   MODE,
   PERMIT2,
   VERIFY_LIMITS,
   accountAbi,
   compile,
   erc20Abi,
+  executeFrame,
   guard,
   permit2Abi,
   sealAbi,
@@ -81,3 +83,24 @@ const pgood = compile({ sender: P, seal: d.seal, permit2: PERMIT2, calls: pcalls
 pgood[0] = pverify
 const rp2 = await send({ sender: P, signerKey: keys.deployer, frames: pgood })
 console.log(`   compiled bracket: valid=${rp2.sim.valid}, VERIFY gas ${rp2.receipt?.frameReceipts[0].gasUsed}, allowance left ${formatEther(await pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [P, d.router] }))}   tx ${rp2.hash}`)
+
+console.log(`\n5. ERC-7579 contract-dispatched account ${d.dispatch} (ERC-8286 executionRoute 1): every call goes through its own execute`)
+const X = d.dispatch
+const xcalls: Call[] = [
+  { to: d.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [d.router, maxUint256] }) },
+  { to: d.router, data: encodeFunctionData({ abi: routerAbi, functionName: 'swapExactIn', args: [d.usdc, d.weth, amount, 0n, X] }) },
+]
+const verdict = (fs: FrameSpec[]) => guard(fs, X, d.seal, PERMIT2, true)
+const attempt = async (label: string, fs: FrameSpec[]) => {
+  const r = await send({ sender: X, signerKey: keys.deployer, frames: fs, dryRun: true })
+  console.log(`   ${label.padEnd(52)} guard: ${verdict(fs).reason.padEnd(44)} chain valid=${r.sim.valid}`)
+}
+await attempt('spec Example 2 shape inside one execute batch', specExample({ account: 'dispatched', sender: X, calls: xcalls }))
+const xgood = compile({ sender: X, seal: d.seal, permit2: PERMIT2, account: 'dispatched', calls: xcalls }).frames
+await attempt('same calls plus one direct frame (bypass attempt)', [...xgood, { mode: MODE.SENDER, flags: 0, target: d.usdc, value: 0n, data: xcalls[0].data, label: '' }])
+await attempt('compiled batch sent with delegatecall mode', [xgood[0], executeFrame(X, xcalls, EXEC_MODE.DELEGATECALL)])
+const rx = await send({ sender: X, signerKey: keys.deployer, frames: xgood })
+console.log(`   compiled by zeroallow: valid=${rx.sim.valid}, guard ${verdict(xgood).reason}`)
+table(xgood, rx.receipt?.frameReceipts.map((f) => `${f.status} gas=${f.gasUsed}`))
+const xleft = await pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [X, d.router] })
+console.log(`   allowance left to router: ${formatEther(xleft)}   tx ${rx.hash}`)

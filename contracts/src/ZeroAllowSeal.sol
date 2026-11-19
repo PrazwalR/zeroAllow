@@ -42,14 +42,47 @@ contract ZeroAllowSeal {
         bytes memory blob;
         (ok, blob) = ops.staticcall(abi.encode(uint256(2), uint256(0)));
         if (!ok) revert FramesUnavailable();
-        for (uint256 i = ZeroAllowLib.batchStart(blob, cur); i < cur; ++i) {
+        if (ZeroAllowLib.word(blob, cur, 0) == uint160(msg.sender)) {
+            bytes memory frame;
+            (ok, frame) = ops.staticcall(abi.encode(uint256(5), cur));
+            if (!ok) revert FramesUnavailable();
+            (,, bytes memory data) = abi.decode(frame, (address, uint256, bytes));
+            (uint256 code, bytes memory vb) = ZeroAllowLib.virtualBlob(data);
+            if (code != ZeroAllowLib.OK) revert Unparseable(cur);
+            _walk(vb, 0, _position(vb, _nth(cur)));
+        } else {
+            _walk(blob, ZeroAllowLib.batchStart(blob, cur), cur);
+        }
+        _outs(outs);
+    }
+
+    function _nth(uint256 cur) internal returns (uint256 n) {
+        bytes32 slot = keccak256(abi.encode(address(this), cur));
+        assembly {
+            n := add(tload(slot), 1)
+            tstore(slot, n)
+        }
+    }
+
+    function _position(bytes memory vb, uint256 nth) internal view returns (uint256) {
+        uint256 n = ZeroAllowLib.count(vb);
+        for (uint256 k; k < n; ++k) {
+            if (
+                ZeroAllowLib.word(vb, k, 0) == uint160(address(this))
+                    && ZeroAllowLib.selector(vb, k) == ZeroAllowLib.CHECK_FRAMES && --nth == 0
+            ) return k;
+        }
+        return n;
+    }
+
+    function _walk(bytes memory blob, uint256 from, uint256 to) internal view {
+        for (uint256 i = from; i < to; ++i) {
             if (ZeroAllowLib.word(blob, i, 1) != ZeroAllowLib.MODE_SENDER) continue;
             (uint8 kind, address token, address spender, uint256 id) =
                 ZeroAllowLib.classify(blob, i, msg.sender, permit2);
             if (kind == ZeroAllowLib.MALFORMED) revert Unparseable(i);
             if (kind != ZeroAllowLib.NONE) _closed(ZeroAllowLib.Key(kind, token, spender, id), msg.sender);
         }
-        _outs(outs);
     }
 
     function check(ZeroAllowLib.Key[] calldata keys, Out[] calldata outs) external {

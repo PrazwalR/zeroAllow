@@ -18,6 +18,10 @@ export async function setup() {
   const policyAccount = await deploy('policyAccount', 'Mocks.sol', [me, ops, policy], 'PolicyAccount')
   const factory = await deploy('v2Factory', 'Mocks.sol', [], 'MockV2Factory')
   const router2 = await deploy('v2Router', 'Mocks.sol', [factory], 'MockV2Router')
+  const factory3 = await deploy('v3Factory', 'Mocks.sol', [], 'MockV3Factory')
+  const router3 = await deploy('v3Router', 'Mocks.sol', [factory3], 'MockV3Router')
+  const ur = await deploy('universalRouter', 'Mocks.sol', [PERMIT2, factory, factory3], 'MockUniversalRouter')
+  const dispatch = await deploy('dispatch7579', 'Mocks.sol', [me, ops, policy], 'Dispatch7579Account')
 
   const erc = artifact('Mocks.sol', 'MockERC20').abi
   const w = wallet(keys.deployer)
@@ -38,6 +42,14 @@ export async function setup() {
     await mint(weth, pair, parseEther('1000'))
     await pub.waitForTransactionReceipt({ hash: await w.sendTransaction({ to: pair, data: encodeFunctionData({ abi: parseAbi(['function sync()']), functionName: 'sync' }) }) })
   }
+  const f3 = parseAbi(['function createPool(address,address,uint24) returns (address)', 'function getPool(address,address,uint24) view returns (address)'])
+  let pool3 = (await pub.readContract({ address: factory3, abi: f3, functionName: 'getPool', args: [usdc, weth, 3000] })) as Address
+  if (pool3 === zeroAddress) {
+    await pub.waitForTransactionReceipt({ hash: await w.writeContract({ address: factory3, abi: f3, functionName: 'createPool', args: [usdc, weth, 3000] }) })
+    pool3 = (await pub.readContract({ address: factory3, abi: f3, functionName: 'getPool', args: [usdc, weth, 3000] })) as Address
+  }
+  await mint(usdc, pool3, parseEther('2000000'))
+  await mint(weth, pool3, parseEther('1000'))
   const victims = {
     spec: addr(keys.spec),
     zero: addr(keys.zero),
@@ -47,12 +59,38 @@ export async function setup() {
     asked: addr(keys.asked),
     direct: addr(keys.direct),
     policyAccount,
+    dispatch,
   }
   await mint(usdc, router, parseEther('1000000'))
   await mint(weth, router, parseEther('1000000'))
   for (const v of Object.values(victims)) await mint(usdc, v, parseEther('1000'))
   for (const a of [...Object.values(victims), addr(keys.attacker)]) await fund(a)
-  return { ops, seal, usdc, weth, router, nft, lending, executor, account, swapper, policy, policyAccount, factory, router2, pair, victims, erc }
+  const topUp = (token: Address, to: Address, amount = parseEther('1000')) => mint(token, to, amount)
+  return {
+    ops,
+    seal,
+    usdc,
+    weth,
+    router,
+    nft,
+    lending,
+    executor,
+    account,
+    swapper,
+    policy,
+    policyAccount,
+    dispatch,
+    factory,
+    router2,
+    pair,
+    factory3,
+    router3,
+    pool3,
+    ur,
+    victims,
+    erc,
+    topUp,
+  }
 }
 
 if (import.meta.main) {

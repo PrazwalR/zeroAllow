@@ -70,6 +70,10 @@ contract FrameStore {
         return (sender, frames.length, cur, sigs);
     }
 
+    function full(uint256 i) external view returns (address, uint256, bytes memory) {
+        return (frames[i].target, frames[i].mode, frames[i].data);
+    }
+
     function sig(uint256) external view returns (address, uint256, bytes32) {
         return (scheme == 0 ? address(0) : signer, scheme, sigMsg);
     }
@@ -97,6 +101,9 @@ contract MockFrameOps {
             r = abi.encode(s, sc, m);
         } else if (op == 4) {
             emit Approved(a);
+        } else if (op == 5) {
+            (address t, uint256 m, bytes memory d) = store.full(a);
+            r = abi.encode(t, m, d);
         } else {
             revert();
         }
