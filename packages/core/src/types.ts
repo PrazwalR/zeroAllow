@@ -25,3 +25,5 @@ export type Quirk = { zeroFirst?: boolean; zeroReverts?: boolean; nft?: boolean 
 export type MinOut = { token: Address; amount: bigint }
 
 export type Verdict = { code: number; at: number; reason: string }
+
+export type SealKey = { kind: number; token: Address; spender: Address; id: bigint }

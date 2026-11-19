@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { frameActions } from '@jaw.id/frametx-kit/viem'
 import {
   concatHex,
@@ -6,6 +6,7 @@ import {
   defineChain,
   createWalletClient,
   encodeDeployData,
+  getContractAddress,
   http,
   keccak256,
   parseEther,
@@ -15,7 +16,7 @@ import {
   type Hex,
 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { prepareTx, signAndEncode, simulate, broadcast, type FrameSpec, type Limits } from '../packages/core/src/index.js'
+import { CREATE2_DEPLOYER, planTx, prepareTx, signAndEncode, simulate, broadcast, type FrameSpec, type Limits } from '../packages/core/src/index.js'
 
 const root = new URL('..', import.meta.url).pathname
 const key = process.env.ZEROALLOW_KEY as Hex | undefined
@@ -37,6 +38,10 @@ export const keys = {
   spec: keccak256(concatHex([key, toHex('victim-spec')])),
   zero: keccak256(concatHex([key, toHex('victim-zeroallow')])),
   attacker: keccak256(concatHex([key, toHex('attacker')])),
+  hoarder: keccak256(concatHex([key, toHex('hoarder')])),
+  today: keccak256(concatHex([key, toHex('today-7702')])),
+  asked: keccak256(concatHex([key, toHex('direct-asked')])),
+  direct: keccak256(concatHex([key, toHex('direct-routed')])),
 }
 export const addr = (k: Hex) => privateKeyToAccount(k).address
 export const wallet = (k: Hex) => createWalletClient({ account: privateKeyToAccount(k), chain: hegota, transport: http(rpcUrl) })
@@ -46,24 +51,23 @@ export function artifact(file: string, name = file.replace(/\.(sol|yul)$/, '')) 
   return { abi: j.abi as Abi, bytecode: j.bytecode.object as Hex }
 }
 
-const statePath = `${root}demo/state/deployments.json`
-export const state: Record<string, Address> = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {}
-export function save() {
-  mkdirSync(`${root}demo/state`, { recursive: true })
-  writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n')
+const SALT = `0x${'00'.repeat(32)}` as const
+
+export function predict(file: string, args: unknown[] = [], name?: string): Address {
+  const { abi, bytecode } = artifact(file, name)
+  return getContractAddress({ opcode: 'CREATE2', from: CREATE2_DEPLOYER, salt: SALT, bytecode: encodeDeployData({ abi, bytecode, args }) })
 }
 
 export async function deploy(label: string, file: string, args: unknown[] = [], name?: string): Promise<Address> {
-  if (state[label] && (await pub.getCode({ address: state[label] }))) return state[label]
+  const at = predict(file, args, name)
+  if (await pub.getCode({ address: at })) return at
   const { abi, bytecode } = artifact(file, name)
   const w = wallet(keys.deployer)
-  const hash = await w.sendTransaction({ data: encodeDeployData({ abi, bytecode, args }) })
+  const hash = await w.sendTransaction({ to: CREATE2_DEPLOYER, data: concatHex([SALT, encodeDeployData({ abi, bytecode, args })]) })
   const r = await pub.waitForTransactionReceipt({ hash })
-  if (!r.contractAddress || r.status !== 'success') throw new Error(`deploy ${label} failed`)
-  state[label] = r.contractAddress
-  save()
-  console.log(`  deployed ${label.padEnd(14)} ${r.contractAddress}`)
-  return r.contractAddress
+  if (r.status !== 'success' || !(await pub.getCode({ address: at }))) throw new Error(`deploy ${label} failed`)
+  console.log(`  deployed ${label.padEnd(14)} ${at}`)
+  return at
 }
 
 export async function fund(to: Address, eth = '0.05') {
@@ -74,9 +78,13 @@ export async function fund(to: Address, eth = '0.05') {
 }
 
 export async function send(p: { sender: Address; signerKey: Hex; frames: FrameSpec[]; limits?: (f: FrameSpec, i: number) => Limits; dryRun?: boolean }) {
-  const tx = await prepareTx(pub, { chainId: BigInt(hegota.id), sender: p.sender, signer: addr(p.signerKey), frames: p.frames, limits: p.limits })
-  const { raw } = await signAndEncode(tx, p.signerKey)
-  const sim = await simulate(pub, raw)
+  const base = { chainId: BigInt(hegota.id), sender: p.sender, signer: addr(p.signerKey), frames: p.frames }
+  const { raw, sim } = p.limits
+    ? await (async () => {
+        const { raw } = await signAndEncode(await prepareTx(pub, { ...base, limits: p.limits }), p.signerKey)
+        return { raw, sim: await simulate(pub, raw) }
+      })()
+    : await planTx(pub, base, p.signerKey)
   if (p.dryRun || !sim.valid) return { sim, raw }
   const hash = await broadcast(pub, raw)
   const receipt = await frames.waitForFrameTransactionReceipt({ hash, timeout: 120_000 })

@@ -93,6 +93,21 @@ contract ZeroAllowSeal {
         if (kind == ZeroAllowLib.E6909_OPERATOR) {
             return _atMost(k.token, abi.encodeWithSelector(0xb6363cf2, owner, k.spender), 0);
         }
+        if (kind == ZeroAllowLib.DELEGATION) {
+            return _atMost(k.token, abi.encodeWithSelector(0x6bd76d24, owner, k.spender), MAX_RESIDUAL);
+        }
+        if (kind == ZeroAllowLib.COMET) {
+            return _atMost(k.token, abi.encodeWithSelector(0xa1654379, owner, k.spender), 0);
+        }
+        if (kind == ZeroAllowLib.MORPHO) {
+            return _atMost(k.token, abi.encodeWithSelector(0x65e4ad9e, owner, k.spender), 0);
+        }
+        if (kind == ZeroAllowLib.RELAYER) {
+            return _atMost(k.token, abi.encodeWithSelector(0xfec90d72, owner, k.spender), 0);
+        }
+        if (kind == ZeroAllowLib.ERC777) {
+            return _atMost(k.token, abi.encodeWithSelector(0xd95b6371, k.spender, owner), 0);
+        }
         return kind == ZeroAllowLib.NONE;
     }
 

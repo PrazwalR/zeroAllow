@@ -7,8 +7,21 @@ import {ZeroAllowLib} from "../src/ZeroAllowLib.sol";
 import {ZeroAllowSeal} from "../src/ZeroAllowSeal.sol";
 import {ZeroAllowAccount} from "../src/ZeroAllowAccount.sol";
 import {
-    MockERC20, UsdtLike, FalseOnZeroApprove, ZeroApproveReverts, MockNFT, VulnerableRouter
+    MockERC20,
+    UsdtLike,
+    FalseOnZeroApprove,
+    ZeroApproveReverts,
+    MockNFT,
+    VulnerableRouter,
+    MockDelegations,
+    Permit1271Token,
+    BatchExecutor,
+    MockV2Pair,
+    MockV2Factory,
+    MockV2Router
 } from "../src/mocks/Mocks.sol";
+import {ZeroAllowSwapper} from "../src/ZeroAllowSwapper.sol";
+import {ZeroAllowPolicy} from "../src/ZeroAllowPolicy.sol";
 
 contract ZeroAllowTest is Test {
     address constant ENTRY_POINT = address(0xaa);
@@ -396,20 +409,251 @@ contract ZeroAllowTest is Test {
         seal.checkFrames(_noOuts());
     }
 
-    function test_gas_guard_64_frames() public {
+    function _grant(MockDelegations d, uint8 kind, bool on) internal view returns (bytes memory) {
+        address r = address(router);
+        if (kind == ZeroAllowLib.DELEGATION) return abi.encodeCall(d.approveDelegation, (r, on ? 5e18 : 0));
+        if (kind == ZeroAllowLib.COMET) return abi.encodeCall(d.allow, (r, on));
+        if (kind == ZeroAllowLib.MORPHO) return abi.encodeCall(d.setAuthorization, (r, on));
+        if (kind == ZeroAllowLib.RELAYER) return abi.encodeCall(d.setRelayerApproval, (address(acct), r, on));
+        return on ? abi.encodeCall(d.authorizeOperator, (r)) : abi.encodeCall(d.revokeOperator, (r));
+    }
+
+    function test_delegation_kinds_guarded_and_sealed() public {
+        MockDelegations d = new MockDelegations();
+        for (uint8 kind = ZeroAllowLib.DELEGATION; kind <= ZeroAllowLib.ERC777; ++kind) {
+            F[] memory fs = _specExample(address(acct), 1e18);
+            fs[1] = _s(address(d), _grant(d, kind, true), true);
+            _expectRejected(fs, ZeroAllowLib.UNSEALED, 1);
+
+            F[] memory ok = new F[](4);
+            ok[0] = _v(address(acct));
+            ok[1] = _s(address(d), _grant(d, kind, true), true);
+            ok[2] = _s(address(d), _grant(d, kind, false), true);
+            ok[3] = _sealF(_noOuts());
+            _validate(ok);
+            this.runBatch(address(acct), ok);
+
+            ok[2] = _s(address(d), abi.encodeCall(d.isAuthorized, (address(acct), address(router))), true);
+            vm.expectRevert(abi.encodeWithSelector(ZeroAllowSeal.Open.selector, kind, address(d), address(router), 0));
+            this.runBatch(address(acct), ok);
+        }
+    }
+
+    function test_validate_refuses_default_frame_caller() public {
+        F[] memory fs = _bracket(address(acct), address(usdc), 1e18);
+        fs[0].mode = DEFAULT;
+        store.load(address(acct), fs);
+        vm.prank(ENTRY_POINT);
+        vm.expectRevert(ZeroAllowAccount.NotVerify.selector);
+        acct.validate(0);
+    }
+
+    function test_guard_relayer_for_other_sender_is_neutral() public {
+        MockDelegations d = new MockDelegations();
+        F[] memory fs = _specExample(address(acct), 1e18);
+        fs[1] = _s(address(d), abi.encodeCall(d.setRelayerApproval, (address(0x1234), address(router), true)), true);
+        _validate(fs);
+    }
+
+    function test_account_cannot_sign_permits() public {
+        Permit1271Token t = new Permit1271Token();
+        bytes32 dg = t.digest(address(acct), attacker, 1e18, 1);
+        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(ownerKey, dg);
+        vm.expectRevert(bytes("1271"));
+        t.permit(address(acct), attacker, 1e18, 1, abi.encodePacked(r, sg, v));
+        (bool ok,) = address(acct).staticcall(abi.encodeWithSelector(0x1626ba7e, dg, abi.encodePacked(r, sg, v)));
+        assertFalse(ok);
+        assertEq(t.allowance(address(acct), attacker), 0);
+
+        dg = t.digest(owner, attacker, 1e18, 1);
+        (v, r, sg) = vm.sign(ownerKey, dg);
+        t.permit(owner, attacker, 1e18, 1, abi.encodePacked(r, sg, v));
+        assertEq(t.allowance(owner, attacker), 1e18);
+    }
+
+    function test_account_receives_nft() public {
+        MockNFT nft = new MockNFT();
+        nft.mint(address(this), 9);
+        nft.safeTransferFrom(address(this), address(acct), 9);
+        assertEq(nft.ownerOf(9), address(acct));
+    }
+
+    function testFuzz_kindOf_matches_classify(uint8 pick, bytes32 a0, bytes32 a1, uint16 cut, uint8 flags) public view {
+        bytes4[22] memory sels = [
+            bytes4(0x095ea7b3), 0x39509351, 0xd73dd623, 0x3177029f, 0xcae9ca51, 0xd505accf, 0x8fcbaf0c,
+            0xa22cb465, 0x426a8493, 0x558a7297, 0x87517c45, 0x2b67b570, 0x2a2d80d1, 0xc04a8a10,
+            0x110496e5, 0xeecea000, 0xfa6e671d, 0x959b8c3f, 0xa9059cbb, 0x23b872dd, 0x09000000, 0xfa000000
+        ];
+        bytes4 sel = pick < 200 ? sels[pick % 22] : bytes4(keccak256(abi.encode(pick, a1)));
+        address p2 = flags & 4 != 0 ? address(0) : address(0x2222);
+        if (flags & 1 != 0) a0 = bytes32(uint256(uint160(address(acct)))) | (a0 & bytes32(uint256(0xff) << 248));
+        bytes memory full = abi.encodePacked(sel, a0, a1, a0, a1, a0, a1, a0, a1);
+        bytes memory data = new bytes(bound(cut, 0, full.length));
+        for (uint256 i; i < data.length; ++i) data[i] = full[i];
+        F[] memory fs = new F[](1);
+        fs[0] = _s(flags & 2 != 0 ? address(0x2222) : address(usdc), data, true);
+        bytes memory blob = Blob.encode(fs);
+        (uint8 k,,,) = ZeroAllowLib.classify(blob, 0, address(acct), p2);
+        assertEq(ZeroAllowLib.kindOf(blob, 0, address(acct), p2), k);
+    }
+
+    function test_today_mode_7702_bracket() public {
+        (address eoa, uint256 key) = makeAddrAndKey("today");
+        BatchExecutor exec = new BatchExecutor();
+        vm.signAndAttachDelegation(address(exec), key);
+        usdc.mint(eoa, 1_000e18);
+
+        ZeroAllowLib.Key[] memory keys = new ZeroAllowLib.Key[](1);
+        keys[0] = ZeroAllowLib.Key(ZeroAllowLib.APPROVE, address(usdc), address(router), type(uint256).max);
+        BatchExecutor.Call[] memory leaky = new BatchExecutor.Call[](3);
+        leaky[0] = BatchExecutor.Call(address(usdc), 0, abi.encodeWithSelector(0x095ea7b3, address(router), type(uint256).max));
+        leaky[1] = BatchExecutor.Call(address(router), 0, abi.encodeCall(VulnerableRouter.swapExactIn, (address(usdc), address(weth), 100e18, 0, eoa)));
+        leaky[2] = BatchExecutor.Call(address(seal), 0, abi.encodeCall(ZeroAllowSeal.check, (keys, _noOuts())));
+        vm.prank(eoa);
+        vm.expectRevert(abi.encodeWithSelector(ZeroAllowSeal.Open.selector, 1, address(usdc), address(router), type(uint256).max));
+        BatchExecutor(payable(eoa)).execute(leaky);
+        assertEq(usdc.balanceOf(eoa), 1_000e18);
+
+        BatchExecutor.Call[] memory calls = new BatchExecutor.Call[](4);
+        calls[0] = BatchExecutor.Call(address(usdc), 0, abi.encodeWithSelector(0x095ea7b3, address(router), 100e18));
+        calls[1] = leaky[1];
+        calls[2] = BatchExecutor.Call(address(usdc), 0, abi.encodeWithSelector(0x095ea7b3, address(router), 0));
+        keys[0].id = 100e18;
+        calls[3] = BatchExecutor.Call(address(seal), 0, abi.encodeCall(ZeroAllowSeal.check, (keys, _noOuts())));
+        vm.prank(eoa);
+        BatchExecutor(payable(eoa)).execute(calls);
+        assertEq(usdc.allowance(eoa, address(router)), 0);
+        assertEq(usdc.balanceOf(eoa), 900e18);
+    }
+
+    function _shape(F memory f) internal view returns (uint256 g) {
         F[] memory fs = new F[](64);
         fs[0] = _v(address(acct));
-        for (uint256 i = 1; i < 63; i += 2) {
-            fs[i] = _approve(address(usdc), address(router), 1e18, true);
-            fs[i + 1] = _approve(address(usdc), address(router), 0, true);
-        }
+        for (uint256 i = 1; i < 63; ++i) fs[i] = f;
         fs[63] = _sealF(_noOuts());
         bytes memory blob = Blob.encode(fs);
-        uint256 g = gasleft();
-        (uint256 code,) = ZeroAllowLib.guard(blob, address(acct), address(seal), address(0));
+        g = gasleft();
+        (uint256 code,) = ZeroAllowLib.guard(blob, address(acct), address(seal), address(0x2222));
         g -= gasleft();
         assertEq(code, 0);
-        emit log_named_uint("guard gas, 64 frames", g);
-        assertLt(g, 100_000);
+    }
+
+    function test_gas_guard_64_frame_shapes() public {
+        address t = address(usdc);
+        address r = address(router);
+        uint256 revokes = _shape(_approve(t, r, 0, true));
+        uint256 neutral = _shape(_s(t, abi.encodeWithSelector(0xa9059cbb, r, 1), true));
+        uint256 operators = _shape(_s(t, abi.encodeWithSelector(0xa22cb465, r, false), true));
+        uint256 last = _shape(_s(t, abi.encodeWithSelector(0x959b8c3f, r), true));
+        uint256 permit2 = _shape(_s(address(0x2222), abi.encodeWithSelector(0x87517c45, t, r, 0, 0), true));
+        emit log_named_uint("guard gas, 62 revokes", revokes);
+        emit log_named_uint("guard gas, 62 neutral", neutral);
+        emit log_named_uint("guard gas, 62 operator revokes", operators);
+        emit log_named_uint("guard gas, 62 last-case grants", last);
+        emit log_named_uint("guard gas, 62 permit2 approves", permit2);
+        assertLt(revokes, 45_000);
+        assertLt(neutral, 25_000);
+        assertLt(operators, 55_000);
+        assertLt(last, 55_000);
+        assertLt(permit2, 55_000);
+    }
+
+    function _v2() internal returns (MockV2Router r2, MockERC20 dai, address p1, address p2, ZeroAllowSwapper sw) {
+        MockV2Factory f = new MockV2Factory();
+        r2 = new MockV2Router(address(f));
+        dai = new MockERC20("Dai", "DAI");
+        p1 = f.createPair(address(usdc), address(weth));
+        p2 = f.createPair(address(weth), address(dai));
+        usdc.mint(p1, 2_000_000e18);
+        weth.mint(p1, 1_000e18);
+        weth.mint(p2, 1_000e18);
+        dai.mint(p2, 2_000_000e18);
+        MockV2Pair(p1).sync();
+        MockV2Pair(p2).sync();
+        sw = new ZeroAllowSwapper();
+    }
+
+    function _direct(ZeroAllowSwapper sw, address[] memory pairs, uint256 amt, uint256 minOut, uint256 fee)
+        internal
+        view
+        returns (F[] memory fs)
+    {
+        fs = new F[](3);
+        fs[0] = _v(address(acct));
+        fs[1] = _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, pairs[0], amt), true);
+        fs[2] = _s(address(sw), abi.encodeCall(sw.swapV2, (pairs, address(usdc), minOut, address(acct), block.timestamp, fee)), false);
+    }
+
+    function test_direct_route_matches_router_without_any_approval() public {
+        (MockV2Router r2,, address p1,, ZeroAllowSwapper sw) = _v2();
+        address[] memory path = new address[](2);
+        (path[0], path[1]) = (address(usdc), address(weth));
+        address[] memory pairs = new address[](1);
+        pairs[0] = p1;
+        uint256 snap = vm.snapshotState();
+        address other = makeAddr("routerUser");
+        usdc.mint(other, 100e18);
+        vm.startPrank(other);
+        usdc.approve(address(r2), 100e18);
+        uint256 viaRouter = r2.swapExactTokensForTokens(100e18, 0, path, other, block.timestamp)[1];
+        vm.stopPrank();
+        vm.revertToState(snap);
+
+        F[] memory fs = _direct(sw, pairs, 100e18, viaRouter, 30);
+        _validate(fs);
+        this.runBatch(address(acct), fs);
+        assertEq(weth.balanceOf(address(acct)), viaRouter);
+        assertEq(usdc.balanceOf(address(acct)), 900e18);
+        assertEq(usdc.allowance(address(acct), address(r2)), 0);
+        assertEq(usdc.allowance(address(acct), address(sw)), 0);
+
+        vm.prank(attacker);
+        vm.expectRevert(bytes("call"));
+        r2.multicall(address(usdc), abi.encodeWithSelector(0x23b872dd, address(acct), attacker, 1));
+    }
+
+    function test_direct_route_multi_hop() public {
+        (, MockERC20 dai, address p1, address p2, ZeroAllowSwapper sw) = _v2();
+        address[] memory pairs = new address[](2);
+        (pairs[0], pairs[1]) = (p1, p2);
+        this.runBatch(address(acct), _direct(sw, pairs, 100e18, 1, 30));
+        assertGt(dai.balanceOf(address(acct)), 98e18);
+        assertEq(weth.balanceOf(address(acct)), 0);
+    }
+
+    function test_direct_route_slippage_unwinds_transfer() public {
+        (,, address p1,, ZeroAllowSwapper sw) = _v2();
+        address[] memory pairs = new address[](1);
+        pairs[0] = p1;
+        vm.expectRevert();
+        this.runBatch(address(acct), _direct(sw, pairs, 100e18, 1e18, 30));
+        assertEq(usdc.balanceOf(address(acct)), 1_000e18);
+        vm.expectRevert(bytes("K"));
+        this.runBatch(address(acct), _direct(sw, pairs, 100e18, 0, 0));
+    }
+
+    function test_policy_enforces_for_any_account() public {
+        ZeroAllowPolicy policy = new ZeroAllowPolicy(address(ops), address(seal), address(0));
+        address other = makeAddr("kernelLikeAccount");
+        store.load(other, _bracket(other, address(usdc), 1e18));
+        vm.prank(other);
+        policy.enforce();
+
+        store.load(other, _specExample(other, 1e18));
+        vm.prank(other);
+        vm.expectRevert(abi.encodeWithSelector(ZeroAllowPolicy.Rejected.selector, ZeroAllowLib.UNSEALED, 1));
+        policy.enforce();
+
+        MockDelegations d = new MockDelegations();
+        F[] memory fs = _specExample(other, 1e18);
+        fs[1] = _s(address(d), abi.encodeCall(d.approveDelegation, (address(router), 1)), true);
+        store.load(other, fs);
+        vm.prank(other);
+        vm.expectRevert(abi.encodeWithSelector(ZeroAllowPolicy.Rejected.selector, ZeroAllowLib.UNSEALED, 1));
+        policy.enforce();
+
+        vm.prank(attacker);
+        vm.expectRevert(ZeroAllowPolicy.NotSender.selector);
+        policy.enforce();
     }
 }

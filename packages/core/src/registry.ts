@@ -37,6 +37,21 @@ export function classify(target: Address, data: Hex, owner: Address, permit2?: A
   } else if (s === SEL.setOperator) {
     need = 2
     c = { kind: KIND.E6909_OPERATOR, token: target, spender: addr(data, 0), id: 0n, on: word(data, 1) !== 0n }
+  } else if (s === SEL.approveDelegation) {
+    need = 2
+    c = { kind: KIND.DELEGATION, token: target, spender: addr(data, 0), id: 0n, amount: word(data, 1) }
+  } else if (s === SEL.allow) {
+    need = 2
+    c = { kind: KIND.COMET, token: target, spender: addr(data, 0), id: 0n, on: word(data, 1) !== 0n }
+  } else if (s === SEL.setAuthorization) {
+    need = 2
+    c = { kind: KIND.MORPHO, token: target, spender: addr(data, 0), id: 0n, on: word(data, 1) !== 0n }
+  } else if (s === SEL.setRelayerApproval) {
+    need = 3
+    if (same(addr(data, 0), owner)) c = { kind: KIND.RELAYER, token: target, spender: addr(data, 1), id: 0n, on: word(data, 2) !== 0n }
+  } else if (s === SEL.authorizeOperator) {
+    need = 1
+    c = { kind: KIND.ERC777, token: target, spender: addr(data, 0), id: 0n, on: true }
   } else if (permit2 && !same(permit2, zeroAddress) && same(target, permit2)) {
     if (s === SEL.permit2Approve) {
       need = 4
@@ -58,11 +73,16 @@ export function isGrant(c: Classified): boolean {
     case KIND.APPROVE:
     case KIND.E6909:
     case KIND.PERMIT2:
+    case KIND.DELEGATION:
       return c.amount === undefined || c.amount > 0n
     case KIND.ERC20:
+    case KIND.ERC777:
       return true
     case KIND.OPERATOR:
     case KIND.E6909_OPERATOR:
+    case KIND.COMET:
+    case KIND.MORPHO:
+    case KIND.RELAYER:
       return c.on === true
     default:
       return false

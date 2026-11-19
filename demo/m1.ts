@@ -21,7 +21,7 @@ const gas = (r: { receipt?: { frameReceipts: { gasUsed: bigint }[] } }) => r.rec
 const A = d.victims.spec
 const B = d.victims.zero
 
-console.log(`\nA ${A}  sends EIP-8141 spec example 1: approve(router, max) + swap, atomic`)
+console.log(`\nA ${A}  sends EIP-8141 spec Example 2: atomic approve(router, max) + swap`)
 const fa = specExample({ calls: calls(A) })
 const ra = await send({ sender: A, signerKey: keys.spec, frames: fa })
 table(fa, ra.receipt?.frameReceipts.map((f) => f.status))
