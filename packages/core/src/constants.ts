@@ -4,9 +4,10 @@ export const CREATE2_DEPLOYER = '0x4e59b44847b379578588920ca78fbf26c0b4956c' as 
 export const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as const
 export const CANONICAL = {
   frameOps: '0x726c4A879937d11F89c6cF533Ab16a9cc90CA484',
-  seal: '0xB6E016304f214caeD1f882f2c8C0A2786900D96E',
-  swapper: '0x6d08f9De8EB5980fC9a8Eb474ef407480918523f',
-  policy: '0x033320bfE2F97fDfa0B7c693A5e6de66E1F2f576',
+  seal: '0x5b42D503C481EeB8376F0d68B001309a07965057',
+  swapper: '0x1E7158a100aDA7ad231859553aEd61Cea01fe5e7',
+  policy: '0xf94792bfd02A490d705b9169D197AD144737D5D5',
+  hook: '0x91c85028A449D2601F83dDA82491f519b7318e12',
 } as const
 
 export const MODE = { DEFAULT: 0, VERIFY: 1, SENDER: 2 } as const
@@ -99,6 +100,29 @@ export const executeAbi = parseAbi([
 ])
 
 export const executionsParams = parseAbiParameters('(address target, uint256 value, bytes callData)[]')
+
+export const coinbaseAbi = parseAbi([
+  'struct Call { address target; uint256 value; bytes data; }',
+  'function execute(address target, uint256 value, bytes data) payable',
+  'function executeBatch(Call[] calls) payable',
+])
+
+export const lightAccountAbi = parseAbi([
+  'function execute(address dest, uint256 value, bytes func) payable',
+  'function executeBatch(address[] dest, bytes[] func) payable',
+  'function executeBatch(address[] dest, uint256[] value, bytes[] func) payable',
+])
+
+export const hookAbi = parseAbi([
+  'struct Key { uint8 kind; address token; address spender; uint256 id; }',
+  'function preCheck(address msgSender, uint256 msgValue, bytes msgData) view returns (bytes)',
+  'function postCheck(bytes hookData) view',
+  'function isModuleType(uint256 moduleTypeId) pure returns (bool)',
+  'error Open(uint8 kind, address token, address spender, uint256 id)',
+  'error Unparseable()',
+  'error SelfCall()',
+  'error DelegateCall()',
+])
 
 export const erc20Abi = parseAbi([
   'function approve(address spender, uint256 amount) returns (bool)',

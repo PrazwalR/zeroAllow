@@ -4,6 +4,7 @@ import {
   createPublicClient,
   createWalletClient,
   custom,
+  decodeFunctionData,
   encodeAbiParameters,
   encodeFunctionData,
   getAddress,
@@ -31,6 +32,7 @@ import {
   erc20Abi,
   nftAbi,
   permit2Abi,
+  prepare,
   previewCalls,
   revokeCalls,
   revokeKeys,
@@ -38,6 +40,9 @@ import {
   scan,
   v2RouterAbi,
   v3Path,
+  V4,
+  callsOracle,
+  tighten,
   sendAtomic,
   type Call,
 } from '../src/index.js'
@@ -136,13 +141,31 @@ describe.skipIf(!hasAnvil)('m3 on anvil (prague, 7702, eth_simulateV1)', () => {
     await write(dw, a.weth, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pair, parseEther('1000')] }))
     await write(dw, a.pair, encodeFunctionData({ abi: parseAbi(['function sync()']), functionName: 'sync' }))
     a.factory3 = await deploy('Mocks.sol', 'MockV3Factory')
-    a.router3 = await deploy('Mocks.sol', 'MockV3Router', [a.factory3])
-    a.ur = await deploy('Mocks.sol', 'MockUniversalRouter', [PERMIT2, a.factory, a.factory3])
+    a.router3 = await deploy('Mocks.sol', 'MockV3Router', [a.factory3, a.factory])
+    a.pm = await deploy('Mocks.sol', 'MockPoolManager')
+    a.ur = await deploy('Mocks.sol', 'MockUniversalRouter', [PERMIT2, a.factory, a.factory3, a.pm])
+    a.greedy = await deploy('Mocks.sol', 'GreedyRouter')
     const f3 = parseAbi(['function createPool(address,address,uint24) returns (address)', 'function getPool(address,address,uint24) view returns (address)'])
     await write(dw, a.factory3, encodeFunctionData({ abi: f3, functionName: 'createPool', args: [a.usdc, a.weth, 3000] }))
     a.pool = getAddress(await pub.readContract({ address: a.factory3, abi: f3, functionName: 'getPool', args: [a.usdc, a.weth, 3000] }))
     await write(dw, a.usdc, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pool, parseEther('2000000')] }))
     await write(dw, a.weth, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pool, parseEther('1000')] }))
+    await write(dw, a.usdc, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.greedy, parseEther('100000')] }))
+    await write(dw, a.weth, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.greedy, parseEther('1000')] }))
+    await write(dw, a.usdc, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pm, parseEther('2000000')] }))
+    await write(dw, a.weth, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pm, parseEther('1000')] }))
+    const [c0, c1] = BigInt(a.usdc) < BigInt(a.weth) ? [a.usdc, a.weth] : [a.weth, a.usdc]
+    a.c0 = c0
+    a.c1 = c1
+    const pmAbi = parseAbi(['struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }', 'function initialize(PoolKey key, uint256 r0, uint256 r1)'])
+    const [r0, r1] = c0 === a.usdc ? [parseEther('2000000'), parseEther('1000')] : [parseEther('1000'), parseEther('2000000')]
+    await write(dw, a.pm, encodeFunctionData({ abi: pmAbi, functionName: 'initialize', args: [{ currency0: c0, currency1: c1, fee: 3000, tickSpacing: 60, hooks: '0x0000000000000000000000000000000000000000' }, r0, r1] }))
+    await pub.request({ method: 'anvil_setBalance', params: [a.pm, numberToHex(parseEther('1000'))] } as never)
+    await write(dw, a.usdc, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.pm, parseEther('2000000')] }))
+    await write(dw, a.pm, encodeFunctionData({ abi: pmAbi, functionName: 'initialize', args: [{ currency0: '0x0000000000000000000000000000000000000000', currency1: a.usdc, fee: 3000, tickSpacing: 60, hooks: '0x0000000000000000000000000000000000000000' }, parseEther('1000'), parseEther('2000000')] }))
+    a.hook = await deploy('ZeroAllowHook.sol', 'ZeroAllowHook', [a.seal, PERMIT2])
+    a.kernel = await deploy('Mocks.sol', 'MockKernelLike', [deployer.address, deployer.address, a.hook, false])
+    await write(dw, a.usdc, encodeFunctionData({ abi: mint, functionName: 'mint', args: [a.kernel, parseEther('1000')] }))
   }, 60_000)
 
   afterAll(() => anvil?.kill())
@@ -306,5 +329,125 @@ describe.skipIf(!hasAnvil)('m3 on anvil (prague, 7702, eth_simulateV1)', () => {
     expect((await execute7702(c2.calls)).status).toBe('success')
     expect(await bal(a.weth, user.address)).toBeGreaterThan(w1)
     expect((await bal(a.usdc, a.ur)) + (await bal(a.weth, a.ur))).toBe(0n)
+  }, 60_000)
+
+  test('V4 through the Universal Router: settled from the router balance, nothing approved', async () => {
+    const bal = (t: Address, o: Address) => pub.readContract({ address: t, abi: erc20Abi, functionName: 'balanceOf', args: [o] })
+    const swap = encodeAbiParameters(parseAbiParameters('((address, address, uint24, int24, address), bool, uint128, uint128, bytes)'), [
+      [[a.c0, a.c1, 3000, 60, '0x0000000000000000000000000000000000000000'], a.usdc === a.c0, parseEther('20'), 1n, '0x'],
+    ])
+    const two = (t: Address, n: bigint) => encodeAbiParameters(parseAbiParameters('address, uint256'), [t, n])
+    const v4 = encodeAbiParameters(parseAbiParameters('bytes, bytes[]'), [
+      `0x${[V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE_ALL, V4.TAKE_ALL].map((x) => x.toString(16).padStart(2, '0')).join('')}`,
+      [swap, two(a.usdc, parseEther('20')), two(a.weth, 1n)],
+    ])
+    const request: Call[] = [
+      { to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [PERMIT2, maxUint256] }) },
+      { to: PERMIT2, data: encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [a.usdc, a.ur, (1n << 160n) - 1n, 2 ** 48 - 1] }) },
+      { to: a.ur, data: encodeUr({ commands: [CMD.V4_SWAP], inputs: [v4], deadline: 2n ** 40n }) },
+    ]
+    const routed = await routeDirect(pub, { sender: user.address, seal: a.seal, calls: request }, { swapper: a.swapper })
+    expect(routed.calls.map((c) => c.to)).toEqual([a.usdc, a.ur])
+    const { calls, keys } = compileCalls(routed)
+    expect(keys).toEqual([])
+    const [w0, u0] = [await bal(a.weth, user.address), await bal(a.usdc, user.address)]
+    expect((await execute7702(calls)).status).toBe('success')
+    expect(await bal(a.weth, user.address)).toBeGreaterThan(w0)
+    expect(u0 - (await bal(a.usdc, user.address))).toBe(parseEther('20'))
+    expect((await bal(a.usdc, a.ur)) + (await bal(a.weth, a.ur))).toBe(0n)
+  }, 60_000)
+
+  test('tighten: a router that takes whatever it is allowed only gets the stated amount', async () => {
+    const bal = (t: Address) => pub.readContract({ address: t, abi: erc20Abi, functionName: 'balanceOf', args: [user.address] })
+    const greedyAbi = parseAbi(['function swapExactIn(address,address,uint256,uint256,address) returns (uint256)'])
+    const request: Call[] = [
+      { to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [a.greedy, maxUint256] }) },
+      { to: a.greedy, data: encodeFunctionData({ abi: greedyAbi, functionName: 'swapExactIn', args: [a.usdc, a.weth, parseEther('10'), 0n, user.address] }) },
+    ]
+    await write(dw, a.usdc, encodeFunctionData({ abi: parseAbi(['function mint(address,uint256)']), functionName: 'mint', args: [user.address, parseEther('500')] }))
+    const before = await bal(a.usdc)
+    const loose = compileCalls(await prepare(pub, { sender: user.address, seal: a.seal, calls: request }))
+    const snap = (await pub.request({ method: 'evm_snapshot' } as never)) as Hex
+    expect((await execute7702(loose.calls)).status).toBe('success')
+    expect(await bal(a.usdc)).toBe(0n)
+    await pub.request({ method: 'evm_revert', params: [snap] } as never)
+
+    const tight = await tighten(await prepare(pub, { sender: user.address, seal: a.seal, calls: request }), callsOracle(pub))
+    expect(tight.notes.join()).toContain(`-> ${parseEther('10')}`)
+    expect((await execute7702(compileCalls(tight).calls)).status).toBe('success')
+    expect(before - (await bal(a.usdc))).toBe(parseEther('10'))
+    expect(await pub.readContract({ address: a.usdc, abi: erc20Abi, functionName: 'allowance', args: [user.address, a.greedy] })).toBe(0n)
+  }, 60_000)
+
+  test('direct route: SwapRouter02 V2 multicall, V2 exact output, leading PERMIT2_TRANSFER_FROM', async () => {
+    const bal = (t: Address, o: Address) => pub.readContract({ address: t, abi: erc20Abi, functionName: 'balanceOf', args: [o] })
+    const sr02 = parseAbi([
+      'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to) payable returns (uint256)',
+      'function multicall(uint256 deadline, bytes[] data) payable returns (bytes[])',
+      'function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] path, address to, uint256 deadline) returns (uint256[])',
+    ])
+    const inner = encodeFunctionData({ abi: sr02, functionName: 'swapExactTokensForTokens', args: [parseEther('5'), 1n, [a.usdc, a.weth], MSG_SENDER] })
+    const requests: [string, Call[], Address][] = [
+      ['swaprouter02 v2', [{ to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [a.router3, maxUint256] }) }, { to: a.router3, data: encodeFunctionData({ abi: sr02, functionName: 'multicall', args: [2n ** 40n, [inner]] }) }], a.pair],
+      ['v2 exact output', [{ to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [a.router2, maxUint256] }) }, { to: a.router2, data: encodeFunctionData({ abi: sr02, functionName: 'swapTokensForExactTokens', args: [parseEther('0.001'), parseEther('10'), [a.usdc, a.weth], user.address, 2n ** 40n] }) }], a.swapper],
+      ['permit2 transfer from', [
+        { to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [PERMIT2, maxUint256] }) },
+        { to: a.ur, data: encodeUr({ commands: [CMD.PERMIT2_TRANSFER_FROM, CMD.V3_SWAP_EXACT_IN], inputs: [
+          encodeAbiParameters(parseAbiParameters('address, address, uint160'), [a.usdc, '0x0000000000000000000000000000000000000002', parseEther('5')]),
+          encodeAbiParameters(parseAbiParameters('address, uint256, uint256, bytes, bool'), [MSG_SENDER, 1n << 255n, 1n, v3Path([{ a: a.usdc, fee: 3000, b: a.weth }]), false]),
+        ], deadline: 2n ** 40n }) },
+      ], a.ur],
+    ]
+    for (const [name, request, firstHop] of requests) {
+      const routed = await routeDirect(pub, { sender: user.address, seal: a.seal, calls: request }, { swapper: a.swapper })
+      expect(routed.calls.map((c) => c.to), name).toEqual([a.usdc, name === 'swaprouter02 v2' ? a.swapper : name === 'v2 exact output' ? a.swapper : a.ur])
+      expect(decodeFunctionData({ abi: erc20Abi, data: routed.calls[0].data }).args[0], name).toBe(firstHop)
+      const { calls, keys } = compileCalls(routed)
+      expect(keys, name).toEqual([])
+      const [w0, u0] = [await bal(a.weth, user.address), await bal(a.usdc, user.address)]
+      expect((await execute7702(calls)).status, name).toBe('success')
+      expect(await bal(a.weth, user.address), name).toBeGreaterThan(w0)
+      if (name === 'v2 exact output') {
+        expect((await bal(a.weth, user.address)) - w0).toBe(parseEther('0.001'))
+        expect(u0 - (await bal(a.usdc, user.address))).toBeLessThan(parseEther('10'))
+      }
+      expect((await bal(a.usdc, a.swapper)) + (await bal(a.usdc, a.ur)), name).toBe(0n)
+    }
+  }, 60_000)
+
+  test('V4 native ETH out: USDC settled from the router balance, ETH taken to the user', async () => {
+    const key = ['0x0000000000000000000000000000000000000000', a.usdc, 3000, 60, '0x0000000000000000000000000000000000000000'] as const
+    const swap = encodeAbiParameters(parseAbiParameters('((address, address, uint24, int24, address), bool, uint128, uint128, bytes)'), [[key, false, parseEther('20'), 1n, '0x']])
+    const two = (t: Address, n: bigint) => encodeAbiParameters(parseAbiParameters('address, uint256'), [t, n])
+    const v4 = encodeAbiParameters(parseAbiParameters('bytes, bytes[]'), ['0x060c0f', [swap, two(a.usdc, parseEther('20')), two('0x0000000000000000000000000000000000000000', 1n)]])
+    const routed = await routeDirect(pub, { sender: user.address, seal: a.seal, calls: [{ to: a.ur, data: encodeUr({ commands: [CMD.V4_SWAP], inputs: [v4], deadline: 2n ** 40n }) }] }, { swapper: a.swapper })
+    expect(routed.calls.map((c) => c.to)).toEqual([a.usdc, a.ur])
+    const eth0 = await pub.getBalance({ address: user.address })
+    const r = await execute7702(compileCalls(routed).calls)
+    expect(r.status).toBe('success')
+    expect((await pub.getBalance({ address: user.address })) + r.gasUsed * r.effectiveGasPrice).toBeGreaterThan(eth0)
+  }, 60_000)
+
+  test('Kernel-style hook on a plain EVM: the dApp batch reverts, the compiled batch passes', async () => {
+    const kernelAbi = parseAbi([
+      'struct Execution { address target; uint256 value; bytes callData; }',
+      'function executeUserOp(bytes inner) payable',
+      'function execute(bytes32 mode, bytes executionCalldata) payable',
+    ])
+    const routerAbi = parseAbi(['function swapExactIn(address,address,uint256,uint256,address) returns (uint256)'])
+    const dapp: Call[] = [
+      { to: a.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [a.router, maxUint256] }) },
+      { to: a.router, data: encodeFunctionData({ abi: routerAbi, functionName: 'swapExactIn', args: [a.usdc, a.weth, parseEther('10'), 0n, a.kernel] }) },
+    ]
+    const userOp = (calls: Call[]) =>
+      encodeFunctionData({
+        abi: kernelAbi,
+        functionName: 'executeUserOp',
+        args: [encodeFunctionData({ abi: kernelAbi, functionName: 'execute', args: [`0x01${'00'.repeat(31)}`, encodeAbiParameters(parseAbiParameters('(address target, uint256 value, bytes callData)[]'), [calls.map((c) => ({ target: c.to, value: c.value ?? 0n, callData: c.data }))])] })],
+      })
+    await expect(pub.call({ account: deployer.address, to: a.kernel, data: userOp(dapp) })).rejects.toThrow()
+    const { calls } = compileCalls({ sender: a.kernel, seal: a.seal, calls: dapp })
+    await write(dw, a.kernel, userOp(calls))
+    expect(await pub.readContract({ address: a.usdc, abi: erc20Abi, functionName: 'allowance', args: [a.kernel, a.router] })).toBe(0n)
   }, 60_000)
 })

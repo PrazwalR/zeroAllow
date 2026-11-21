@@ -29,6 +29,11 @@ library ZeroAllowLib {
 
     bytes4 internal constant CHECK_FRAMES = 0x1135b925;
     bytes4 internal constant EXECUTE = 0xe9ae5c53;
+    bytes4 internal constant EXECUTE_FROM_EXECUTOR = 0xd691c964;
+    bytes4 internal constant EXECUTE_SINGLE = 0xb61d27f6;
+    bytes4 internal constant EXECUTE_CALLS = 0x34fcd5be;
+    bytes4 internal constant EXECUTE_ARRAYS = 0x47e1da2a;
+    bytes4 internal constant EXECUTE_ARRAYS_NOVALUE = 0x18dfb3c7;
     uint256 internal constant FIRST_BYTES = 0x400400000a004010000000400208080000000000020000402020c0000020200;
 
     struct Key {
@@ -312,24 +317,39 @@ library ZeroAllowLib {
         return guard(blob, sender, seal, permit2);
     }
 
+    function isExecute(bytes4 s) internal pure returns (bool) {
+        return s == EXECUTE || s == EXECUTE_SINGLE || s == EXECUTE_CALLS || s == EXECUTE_ARRAYS
+            || s == EXECUTE_ARRAYS_NOVALUE;
+    }
+
     function dispatched(bytes memory blob, uint256 i, address sender) internal pure returns (bool) {
         return word(blob, i, 1) == MODE_SENDER && word(blob, i, 0) == uint160(sender) && word(blob, i, 4) >= 4
-            && selector(blob, i) == EXECUTE;
+            && isExecute(selector(blob, i));
     }
 
     function virtualBlob(bytes memory d) internal pure returns (uint256 code, bytes memory vb) {
+        if (d.length < 4) return (UNPARSEABLE, vb);
+        bytes4 s = bytes4(bytes32(_at(d, 0)));
+        if (s == EXECUTE || s == EXECUTE_FROM_EXECUTOR) return _erc7579(d);
+        if (s == EXECUTE_CALLS) return _tuples(d, 4, d.length, 0);
+        if (s == EXECUTE_ARRAYS) return _arrays(d, true);
+        if (s == EXECUTE_ARRAYS_NOVALUE) return _arrays(d, false);
+        if (s == EXECUTE_SINGLE) return _single(d);
+        return (SELF_CALL, vb);
+    }
+
+    function _erc7579(bytes memory d) private pure returns (uint256 code, bytes memory vb) {
         uint256 len = d.length;
         if (len < 0x64) return (UNPARSEABLE, vb);
         uint256 mode = _at(d, 4);
         uint256 callType = mode >> 248;
         uint256 execType = (mode >> 240) & 0xff;
-        if (callType > 1 || execType > 1) return (SELF_CALL, vb);
+        if (callType > 1 || execType > 1 || mode << 16 != 0) return (SELF_CALL, vb);
         uint256 off = _at(d, 0x24);
         if (off > len - 0x24) return (UNPARSEABLE, vb);
         uint256 ec = 4 + off + 32;
         uint256 ecLen = _at(d, 4 + off);
         if (ecLen > len - ec) return (UNPARSEABLE, vb);
-        uint256 end = ec + ecLen;
         if (callType == 0) {
             if (ecLen < 52) return (UNPARSEABLE, vb);
             vb = new bytes(32 + STRIDE);
@@ -337,9 +357,31 @@ library ZeroAllowLib {
             _setCount(vb, 1);
             return (OK, vb);
         }
-        if (ecLen < 32) return (UNPARSEABLE, vb);
+        return _tuples(d, ec, ec + ecLen, execType);
+    }
+
+    function _single(bytes memory d) private pure returns (uint256 code, bytes memory vb) {
+        uint256 len = d.length;
+        if (len < 0x64) return (UNPARSEABLE, vb);
+        uint256 off = _at(d, 0x44);
+        if (off > len - 0x24) return (UNPARSEABLE, vb);
+        uint256 c = 4 + off;
+        uint256 cLen = _at(d, c);
+        if (cLen > len - c - 32) return (UNPARSEABLE, vb);
+        vb = new bytes(32 + STRIDE);
+        _put(vb, 0, uint160(_at(d, 4)), 0, _at(d, 0x24), d, c + 32, cLen);
+        _setCount(vb, 1);
+        return (OK, vb);
+    }
+
+    function _tuples(bytes memory d, uint256 ec, uint256 end, uint256 execType)
+        private
+        pure
+        returns (uint256 code, bytes memory vb)
+    {
+        if (end - ec < 32) return (UNPARSEABLE, vb);
         uint256 aOff = _at(d, ec);
-        if (aOff > ecLen - 32) return (UNPARSEABLE, vb);
+        if (aOff > end - ec - 32) return (UNPARSEABLE, vb);
         uint256 heads = ec + aOff + 32;
         uint256 n = _at(d, heads - 32);
         if (n > (end - heads) / 32) return (UNPARSEABLE, vb);
@@ -372,6 +414,56 @@ library ZeroAllowLib {
                 mstore(add(p, 0x20), MODE_SENDER)
                 mstore(add(p, 0x40), mul(ATOMIC, and(iszero(execType), lt(add(k, 1), n))))
                 mstore(add(p, 0x60), mload(add(base, add(t, 32))))
+                mstore(add(p, 0x80), cLen)
+                let h := cLen
+                if gt(h, HEAD) { h := HEAD }
+                mcopy(add(p, 0xa0), add(base, add(c, 32)), h)
+            }
+            mstore(add(vb, 0x20), n)
+        }
+        return (bad == 0 ? OK : UNPARSEABLE, vb);
+    }
+
+    function _arrays(bytes memory d, bool withValue) private pure returns (uint256 code, bytes memory vb) {
+        uint256 len = d.length;
+        if (len < (withValue ? 0x64 : 0x44)) return (UNPARSEABLE, vb);
+        uint256 dA = _at(d, 4);
+        uint256 vA = withValue ? _at(d, 0x24) : 0;
+        uint256 fA = _at(d, withValue ? 0x44 : 0x24);
+        if (dA > len - 0x24 || vA > len - 0x24 || fA > len - 0x24) return (UNPARSEABLE, vb);
+        dA += 4;
+        vA += 4;
+        fA += 4;
+        uint256 n = _at(d, dA);
+        if (n > (len - dA - 32) / 32 || _at(d, fA) != n || n > (len - fA - 32) / 32) return (UNPARSEABLE, vb);
+        uint256 m = withValue ? _at(d, vA) : 0;
+        if (m != 0 && (m != n || m > (len - vA - 32) / 32)) return (UNPARSEABLE, vb);
+        vb = new bytes(32 + n * STRIDE);
+        uint256 bad;
+        assembly {
+            let base := add(d, 0x20)
+            let out := add(vb, 0x40)
+            let fHeads := add(fA, 32)
+            let room := sub(len, fHeads)
+            for { let k := 0 } lt(k, n) { k := add(k, 1) } {
+                let o := mload(add(base, add(fHeads, shl(5, k))))
+                if or(gt(o, room), lt(sub(room, o), 32)) {
+                    bad := 1
+                    break
+                }
+                let c := add(fHeads, o)
+                let cLen := mload(add(base, c))
+                if gt(cLen, sub(sub(len, c), 32)) {
+                    bad := 1
+                    break
+                }
+                let p := add(out, mul(k, 0x180))
+                mstore(p, and(mload(add(base, add(add(dA, 32), shl(5, k)))), 0xffffffffffffffffffffffffffffffffffffffff))
+                mstore(add(p, 0x20), MODE_SENDER)
+                mstore(add(p, 0x40), mul(ATOMIC, lt(add(k, 1), n)))
+                let v := 0
+                if m { v := mload(add(base, add(add(vA, 32), shl(5, k)))) }
+                mstore(add(p, 0x60), v)
                 mstore(add(p, 0x80), cLen)
                 let h := cLen
                 if gt(h, HEAD) { h := HEAD }

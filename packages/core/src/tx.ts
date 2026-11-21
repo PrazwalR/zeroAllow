@@ -28,11 +28,13 @@ const budgetFor = (frames: FrameSpec[]) => {
   return TX_MAX_GAS_LIMIT - FRAME_TX_INTRINSIC_COST - FRAME_TX_PER_FRAME_COST * BigInt(frames.length) - VERIFY_LIMITS.execution * verifies - CALLDATA_MARGIN
 }
 
-export function fitLimits(frames: FrameSpec[]): (f: FrameSpec, i: number) => Limits {
+export const MAX_STATE = 4_000_000n
+
+export function fitLimits(frames: FrameSpec[], state = SENDER_LIMITS.state): (f: FrameSpec, i: number) => Limits {
   const others = BigInt(frames.filter((f) => f.mode !== MODE.VERIFY).length)
   const budget = budgetFor(frames)
   const per = others > 0n && budget / others < SENDER_LIMITS.execution ? budget / others : SENDER_LIMITS.execution
-  return (f) => (f.mode === MODE.VERIFY ? VERIFY_LIMITS : { execution: per, state: SENDER_LIMITS.state })
+  return (f) => (f.mode === MODE.VERIFY ? VERIFY_LIMITS : { execution: per, state })
 }
 
 export type BuildParams = {
@@ -98,7 +100,7 @@ export async function planTx(rpc: Rpc, p: Omit<BuildParams, 'nonceSeq' | 'maxFee
     return { ...signed, sim: await simulate(rpc, signed.raw) }
   }
   const tighten = (used: bigint, i: number): Limits =>
-    p.frames[i].mode === MODE.VERIFY ? VERIFY_LIMITS : { execution: (used * 13n) / 10n + 10_000n, state: SENDER_LIMITS.state }
+    p.frames[i].mode === MODE.VERIFY ? VERIFY_LIMITS : { execution: (used * 13n) / 10n + 10_000n, state: lim[i].state }
   let cur = await run(lim)
   for (let round = 0; round < 4; round++) {
     const fr = cur.sim.frames
@@ -107,15 +109,17 @@ export async function planTx(rpc: Rpc, p: Omit<BuildParams, 'nonceSeq' | 'maxFee
       const tight = await run(fr.map((f, i) => tighten(f.gasUsed, i)))
       return tight.sim.valid && tight.sim.executionStatus === 'success' ? tight : cur
     }
-    const bad = fr.findIndex((f, i) => !f.succeeded && f.gasUsed > 0n && f.gasUsed * 100n >= lim[i].execution * 99n)
+    const bad = fr.findIndex((f, i) => !f.succeeded && f.gasUsed > 0n && p.frames[i].mode !== MODE.VERIFY)
     if (bad < 0) return cur
     fr.forEach((f, i) => {
       if (f.succeeded && i !== bad) lim[i] = tighten(f.gasUsed, i)
     })
     const others = lim.reduce((a, l, i) => (i === bad || p.frames[i].mode === MODE.VERIFY ? a : a + l.execution), 0n)
     const room = budgetFor(p.frames) - others
-    if (room <= lim[bad].execution) return cur
-    lim[bad] = { execution: room, state: SENDER_LIMITS.state }
+    const execution = room > lim[bad].execution ? room : lim[bad].execution
+    const state = lim[bad].state * 8n < MAX_STATE ? lim[bad].state * 8n : MAX_STATE
+    if (execution === lim[bad].execution && state === lim[bad].state) return cur
+    lim[bad] = { execution, state }
     cur = await run(lim)
   }
   return cur

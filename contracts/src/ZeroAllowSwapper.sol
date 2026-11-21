@@ -73,6 +73,49 @@ contract ZeroAllowSwapper {
         if (out < minOut) revert Slippage(out, minOut);
     }
 
+    function swapV2ExactOut(
+        address[] calldata pairs,
+        address tokenIn,
+        uint256 amountOut,
+        uint256 amountInMax,
+        address to,
+        uint256 deadline,
+        uint256 feeBps
+    ) external lock returns (uint256 amountIn) {
+        if (block.timestamp > deadline) revert Expired();
+        uint256 n = pairs.length;
+        if (n == 0 || feeBps >= 10_000 || amountOut == 0) revert BadPath(0);
+        address[] memory tokens = new address[](n + 1);
+        tokens[0] = tokenIn;
+        for (uint256 i; i < n; ++i) {
+            address t0 = IV2Pair(pairs[i]).token0();
+            address t1 = IV2Pair(pairs[i]).token1();
+            if (tokens[i] != t0 && tokens[i] != t1) revert BadPath(i);
+            tokens[i + 1] = tokens[i] == t0 ? t1 : t0;
+        }
+        uint256[] memory amounts = new uint256[](n + 1);
+        amounts[n] = amountOut;
+        for (uint256 i = n; i > 0; --i) {
+            (uint256 r0, uint256 r1,) = IV2Pair(pairs[i - 1]).getReserves();
+            (uint256 rIn, uint256 rOut) = tokens[i - 1] == IV2Pair(pairs[i - 1]).token0() ? (r0, r1) : (r1, r0);
+            if (amounts[i] >= rOut) revert BadPath(i - 1);
+            amounts[i - 1] = (rIn * amounts[i] * 10_000) / ((rOut - amounts[i]) * (10_000 - feeBps)) + 1;
+        }
+        amountIn = amounts[0];
+        if (amountIn > amountInMax) revert Slippage(amountInMax, amountIn);
+        uint256 before = _balance(tokens[n], to);
+        _transfer(tokenIn, pairs[0], amountIn);
+        for (uint256 i; i < n; ++i) {
+            bool zero = tokens[i] == IV2Pair(pairs[i]).token0();
+            address recipient = i + 1 < n ? pairs[i + 1] : to;
+            IV2Pair(pairs[i]).swap(zero ? 0 : amounts[i + 1], zero ? amounts[i + 1] : 0, recipient, "");
+        }
+        uint256 got = _balance(tokens[n], to) - before;
+        if (got < amountOut) revert Slippage(got, amountOut);
+        uint256 left = _balance(tokenIn, address(this));
+        if (left > 0) _transfer(tokenIn, msg.sender, left);
+    }
+
     function swapV3(bytes calldata path, address factory, uint256 amountIn, uint256 minOut, address to, uint256 deadline)
         external
         lock
@@ -115,6 +158,7 @@ contract ZeroAllowSwapper {
         if (msg.sender != pool_ || msg.sender == address(0)) revert NotPool();
         uint256 owed = d0 > 0 ? uint256(d0) : d1 > 0 ? uint256(d1) : 0;
         if (owed > max_) revert Overpay(owed, max_);
+        pool_ = address(0);
         _transfer(token_, msg.sender, owed);
     }
 

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeDeployData, encodeFunctionData, getContractAddress, maxUint256, parseAbiParameters, type Abi, type Address, type Client, type Hex } from 'viem'
 import { describe, expect, test } from 'vitest'
-import { ATOMIC, CANONICAL, CMD, CODE, CREATE2_DEPLOYER, KIND, MODE, MSG_SENDER, PERMIT2, VERIFY_LIMITS, decodeUr, encodeUr, executeAbi, executionsParams, permit2Abi, routeDirect, v3Hops, v3Path, classify, compile, compileCalls, delegationAbi, erc20Abi, guard, nftAbi, sealAbi, specExample } from '../src/index.js'
+import { ATOMIC, CANONICAL, CMD, CODE, CONTRACT_BALANCE, CREATE2_DEPLOYER, KIND, MODE, MSG_SENDER, PERMIT2, V4, VERIFY_LIMITS, decodeUr, encodeUr, executeAbi, executionsParams, permit2Abi, routeDirect, tighten, v3Hops, v3Path, classify, compile, compileCalls, delegationAbi, erc20Abi, guard, nftAbi, sealAbi, specExample, sweep } from '../src/index.js'
 import { buildVectors } from '../scripts/vectors.js'
 import { P2, R, S, SEAL, T, approve, cases, delegations, swap } from './cases.js'
 
@@ -153,18 +153,70 @@ describe('universal router direct route', () => {
     expect(decodeUr(r.calls[1].data)!.commands).toEqual([CMD.V3_SWAP_EXACT_OUT, CMD.SWEEP])
   })
 
-  test('falls back on permit2 pulls, unknown commands, contract-balance amounts and native value', async () => {
+  test('falls back on unknown commands, malformed V4 plans, contract-balance amounts and late Permit2 pulls', async () => {
     const path = v3Path([{ a: T, fee: 3000, b: W }])
     const pull = encodeAbiParameters(parseAbiParameters('address, address, uint160'), [T, UR, 5n])
     for (const call of [
-      urCall([CMD.PERMIT2_TRANSFER_FROM, CMD.V3_SWAP_EXACT_IN], [pull, v3In(false, 5n, path)]),
       urCall([0x10], ['0x']),
+      urCall([0x12], ['0x']),
       urCall([CMD.V3_SWAP_EXACT_IN], [v3In(true, 1n << 255n, path)]),
-      urCall([CMD.V3_SWAP_EXACT_IN], [v3In(true, 5n, path)], 1n),
+      urCall([CMD.V3_SWAP_EXACT_IN, CMD.PERMIT2_TRANSFER_FROM], [v3In(false, 5n, path), pull]),
     ]) {
       const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [{ to: T, data: approve(PERMIT2, 5n) }, call] }, { swapper: R })
       expect(r.calls).toEqual([{ to: T, data: approve(PERMIT2, 5n) }, call])
     }
+  })
+
+  test('leading PERMIT2_TRANSFER_FROM becomes a plain transfer; ETH value is kept and swept back', async () => {
+    const path = v3Path([{ a: T, fee: 3000, b: W }])
+    const swapAll = v3In(false, 1n << 255n, path)
+    const toRouter = encodeAbiParameters(parseAbiParameters('address, address, uint160'), [T, '0x0000000000000000000000000000000000000002', 5n])
+    const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [{ to: T, data: approve(PERMIT2, 5n) }, urCall([CMD.PERMIT2_TRANSFER_FROM, CMD.V3_SWAP_EXACT_IN], [toRouter, swapAll])] }, { swapper: R })
+    expect(r.calls.map((c) => c.to)).toEqual([T, UR])
+    expect(decodeFunctionData({ abi: erc20Abi, data: r.calls[0].data }).args).toEqual([UR, 5n])
+    expect(decodeUr(r.calls[1].data)!.commands).toEqual([CMD.V3_SWAP_EXACT_IN, CMD.SWEEP])
+
+    const toPair = encodeAbiParameters(parseAbiParameters('address, address, uint160'), [T, W, 7n])
+    const v2In = encodeAbiParameters(parseAbiParameters('address, uint256, uint256, address[], bool'), [MSG_SENDER, 0n, 1n, [T, W], false])
+    const p = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [urCall([CMD.PERMIT2_TRANSFER_FROM, CMD.V2_SWAP_EXACT_IN], [toPair, v2In])] }, { swapper: R })
+    expect(decodeFunctionData({ abi: erc20Abi, data: p.calls[0].data }).args).toEqual([W, 7n])
+    expect(decodeUr(p.calls[1].data)!.commands).toEqual([CMD.V2_SWAP_EXACT_IN])
+
+    const e = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [urCall([CMD.V3_SWAP_EXACT_IN], [v3In(true, 5n, path)], 3n)] }, { swapper: R })
+    expect(e.calls[1].value).toBe(3n)
+    const u = decodeUr(e.calls[1].data)!
+    expect(u.commands).toEqual([CMD.V3_SWAP_EXACT_IN, CMD.SWEEP, CMD.SWEEP])
+    expect(decodeAbiParameters(parseAbiParameters('address, address, uint256'), u.inputs[2])[0]).toBe('0x0000000000000000000000000000000000000000')
+  })
+
+  test('keeps the bracket when the plan could move the pre-funded surplus to someone else', async () => {
+    const X: Address = '0x000000000000000000000000000000000000bad1'
+    const v2Out = encodeAbiParameters(parseAbiParameters('address, uint256, uint256, address[], bool'), [MSG_SENDER, 1n, 1000n, [T, W], true])
+    const route = (commands: number[], inputs: Hex[]) => routeDirect(nobody, { sender: S, seal: SEAL, calls: [urCall(commands, inputs)] }, { swapper: R })
+    const unwrap = encodeAbiParameters(parseAbiParameters('address, uint256'), [X, 0n])
+    const portion = encodeAbiParameters(parseAbiParameters('address, address, uint256'), [T, X, 10_000n])
+    const spendSurplus = v3In(false, 999n, v3Path([{ a: T, fee: 3000, b: W }]))
+    for (const [c, i] of [
+      [CMD.SWEEP, sweep(T, X)],
+      [CMD.PAY_PORTION, portion],
+      [CMD.UNWRAP_WETH, unwrap],
+      [CMD.V3_SWAP_EXACT_IN, spendSurplus],
+    ] as [number, Hex][]) {
+      expect((await route([CMD.V2_SWAP_EXACT_OUT, c], [v2Out, i])).calls.map((k) => k.to)).toEqual([UR])
+    }
+    expect((await route([CMD.V2_SWAP_EXACT_OUT, CMD.SWEEP], [v2Out, sweep(T, MSG_SENDER)])).calls.map((k) => k.to)).toEqual([T, UR])
+    const v3InUser = v3In(true, 1000n, v3Path([{ a: T, fee: 3000, b: W }]))
+    expect((await route([CMD.V3_SWAP_EXACT_IN, CMD.SWEEP], [v3InUser, sweep(T, X)])).calls.map((k) => k.to)).toEqual([UR])
+    expect((await route([CMD.V3_SWAP_EXACT_IN, CMD.SWEEP], [v3InUser, sweep(T, MSG_SENDER)])).calls.map((k) => k.to)).toEqual([T, UR])
+    expect((await route([CMD.V2_SWAP_EXACT_OUT, CMD.SWEEP], [v2Out, sweep(W, X)])).calls.map((k) => k.to)).toEqual([T, UR])
+
+    const plan = (acts: number[], params: Hex[]) =>
+      encodeAbiParameters(parseAbiParameters('bytes, bytes[]'), [`0x${acts.map((a) => a.toString(16).padStart(2, '0')).join('')}`, params])
+    const two = (a: Address, n: bigint) => encodeAbiParameters(parseAbiParameters('address, uint256'), [a, n])
+    const fromRouter = encodeAbiParameters(parseAbiParameters('address, uint256, bool'), [T, CONTRACT_BALANCE, false])
+    const take = encodeAbiParameters(parseAbiParameters('address, address, uint256'), [T, X, 0n])
+    const v4 = plan([V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE_ALL, V4.TAKE_ALL, V4.SETTLE, V4.TAKE], ['0x1234', two(T, 1000n), two(W, 1n), fromRouter, take])
+    expect((await route([CMD.V4_SWAP], [v4])).calls.map((k) => k.to)).toEqual([UR])
   })
 
   test('bracket fallback revokes Permit2 allowances granted inside router commands', () => {
@@ -176,6 +228,79 @@ describe('universal router direct route', () => {
     expect(guard(frames, S, SEAL, P2).code).toBe(CODE.OK)
     expect(() => compile({ sender: S, seal: SEAL, calls: [ur] })).toThrow(/Permit2 address/)
     expect(v3Hops(path)).toEqual([{ a: T, fee: 3000, b: W }])
+  })
+})
+
+describe('universal router V4_SWAP', () => {
+  const plan = (acts: number[], params: Hex[]) =>
+    encodeAbiParameters(parseAbiParameters('bytes, bytes[]'), [`0x${acts.map((a) => a.toString(16).padStart(2, '0')).join('')}`, params])
+  const two = (a: Address, n: bigint) => encodeAbiParameters(parseAbiParameters('address, uint256'), [a, n])
+  const swapParams = '0x1234' as Hex
+
+  test('SETTLE_ALL from the user becomes SETTLE(OPEN_DELTA) from the router, input pre-transferred and swept', async () => {
+    const call = urCall([CMD.V4_SWAP], [plan([V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE_ALL, V4.TAKE_ALL], [swapParams, two(T, 100n), two(W, 1n)])])
+    const r = await routeDirect(nobody, { sender: S, seal: SEAL, calls: [{ to: PERMIT2, data: p2Approve }, call] }, { swapper: R })
+    expect(r.calls.map((c) => c.to)).toEqual([T, UR])
+    expect(decodeFunctionData({ abi: erc20Abi, data: r.calls[0].data }).args).toEqual([UR, 100n])
+    const u = decodeUr(r.calls[1].data)!
+    expect(u.commands).toEqual([CMD.V4_SWAP, CMD.SWEEP])
+    const [acts, params] = decodeAbiParameters(parseAbiParameters('bytes, bytes[]'), u.inputs[0])
+    expect(acts).toBe('0x060b0f')
+    expect(params[0]).toBe(swapParams)
+    expect(decodeAbiParameters(parseAbiParameters('address, uint256, bool'), params[1])).toEqual([T, 0n, false])
+    expect(params[2]).toBe(two(W, 1n))
+  })
+
+  test('native currency, open-delta user settles and unknown actions keep the bracket', async () => {
+    const zero = '0x0000000000000000000000000000000000000000' as Address
+    for (const p of [
+      plan([V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE_ALL], [swapParams, two(zero, 5n)]),
+      plan([V4.SWAP_EXACT_IN_SINGLE, V4.SETTLE], [swapParams, encodeAbiParameters(parseAbiParameters('address, uint256, bool'), [T, 0n, true])]),
+      plan([V4.SWAP_EXACT_IN_SINGLE, 0x0d], [swapParams, '0x']),
+    ]) {
+      const call = urCall([CMD.V4_SWAP], [p])
+      expect((await routeDirect(nobody, { sender: S, seal: SEAL, calls: [call] }, { swapper: R })).calls).toEqual([call])
+    }
+  })
+})
+
+describe('tighten', () => {
+  const amountOf = (data: Hex) => decodeFunctionData({ abi: erc20Abi, data }).args[1] as bigint
+  test('shrinks an approval to the smallest stated amount that still simulates', async () => {
+    let asked = 0
+    const oracle = async (input: { calls: { data: Hex }[] }) => {
+      asked++
+      return amountOf(input.calls[0].data) >= 100n
+    }
+    const t = await tighten({ sender: S, seal: SEAL, calls: [{ to: T, data: approve(R, 1000n) }, { to: R, data: swap(100n) }] }, oracle)
+    expect(amountOf(t.calls[0].data)).toBe(100n)
+    expect(t.notes.join()).toContain('1000 -> 100')
+    expect(asked).toBeLessThanOrEqual(5)
+  })
+
+  test('both Permit2 layers tighten independently', async () => {
+    const p2 = (data: Hex) => decodeFunctionData({ abi: permit2Abi, data }).args[2] as bigint
+    const oracle = async (input: { calls: { data: Hex }[] }) => amountOf(input.calls[0].data) >= 100n && p2(input.calls[1].data) >= 100n
+    const calls = [
+      { to: T, data: approve(P2, 1000n) },
+      { to: P2, data: encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [T, R, 1000n, 9] }) },
+      { to: R, data: swap(100n) },
+    ]
+    const t = await tighten({ sender: S, seal: SEAL, permit2: P2, calls }, oracle)
+    expect(amountOf(t.calls[0].data)).toBe(100n)
+    expect(p2(t.calls[1].data)).toBe(100n)
+  })
+
+  test('keeps the amounts when nothing smaller works or simulation is unavailable', async () => {
+    const input = { sender: S, seal: SEAL, calls: [{ to: T, data: approve(R, 1000n) }, { to: R, data: swap(100n) }] }
+    const strict = await tighten(input, async (i) => amountOf(i.calls[0].data) >= 1000n)
+    expect(strict.calls).toEqual(input.calls)
+    expect(strict.notes.join()).toContain('no smaller')
+    const down = await tighten(input, async () => {
+      throw new Error('method not found')
+    })
+    expect(down.calls).toEqual(input.calls)
+    expect(down.notes.join()).toContain('unavailable')
   })
 })
 
@@ -251,6 +376,7 @@ describe.skipIf(!existsSync(out))('canonical deployment', () => {
     expect(at('ZeroAllowSeal.sol', 'ZeroAllowSeal', [CANONICAL.frameOps, PERMIT2])).toBe(CANONICAL.seal)
     expect(at('ZeroAllowSwapper.sol', 'ZeroAllowSwapper', [])).toBe(CANONICAL.swapper)
     expect(at('ZeroAllowPolicy.sol', 'ZeroAllowPolicy', [CANONICAL.frameOps, CANONICAL.seal, PERMIT2])).toBe(CANONICAL.policy)
+    expect(at('ZeroAllowHook.sol', 'ZeroAllowHook', [CANONICAL.seal, PERMIT2])).toBe(CANONICAL.hook)
   })
 })
 

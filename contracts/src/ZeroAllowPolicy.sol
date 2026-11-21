@@ -4,9 +4,6 @@ pragma solidity ^0.8.28;
 import {ZeroAllowLib} from "./ZeroAllowLib.sol";
 
 contract ZeroAllowPolicy {
-    uint256 public constant MODULE_TYPE_FRAME_VALIDATOR = 11;
-    uint8 internal constant APPROVE_EXECUTION_AND_PAYMENT = 3;
-
     address public immutable ops;
     address public immutable seal;
     address public immutable permit2;
@@ -49,17 +46,4 @@ contract ZeroAllowPolicy {
         (uint256 code, uint256 at) = check();
         if (code != ZeroAllowLib.OK) revert Rejected(code, at);
     }
-
-    function validateFrame(bytes calldata) external view returns (uint8) {
-        (uint256 code,) = check();
-        return code == ZeroAllowLib.OK ? APPROVE_EXECUTION_AND_PAYMENT : 0;
-    }
-
-    function isModuleType(uint256 moduleTypeId) external pure returns (bool) {
-        return moduleTypeId == MODULE_TYPE_FRAME_VALIDATOR;
-    }
-
-    function onInstall(bytes calldata) external {}
-
-    function onUninstall(bytes calldata) external {}
 }

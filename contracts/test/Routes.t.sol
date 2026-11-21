@@ -14,6 +14,9 @@ import {
     MockV3Factory,
     MockV3Router,
     MockUniversalRouter,
+    MockPoolManager,
+    MockV2Router,
+    GreedyRouter,
     IV3CallbackLike
 } from "../src/mocks/Mocks.sol";
 
@@ -49,6 +52,8 @@ contract RoutesTest is Test {
     MockV3Router r3;
     MockV2Factory f2;
     MockUniversalRouter ur;
+    MockPoolManager pm;
+    MockPoolManager.PoolKey key;
     address owner;
     address attacker = address(0xbad);
     address alice = makeAddr("alice");
@@ -65,9 +70,16 @@ contract RoutesTest is Test {
         weth = new MockERC20("Wrapped Ether", "WETH");
         dai = new MockERC20("Dai", "DAI");
         f3 = new MockV3Factory();
-        r3 = new MockV3Router(address(f3));
         f2 = new MockV2Factory();
-        ur = new MockUniversalRouter(address(p2), address(f2), address(f3));
+        r3 = new MockV3Router(address(f3), address(f2));
+        pm = new MockPoolManager();
+        ur = new MockUniversalRouter(address(p2), address(f2), address(f3), address(pm));
+        (address c0, address c1) = address(usdc) < address(weth) ? (address(usdc), address(weth)) : (address(weth), address(usdc));
+        key = MockPoolManager.PoolKey(c0, c1, 3000, 60, address(0));
+        usdc.mint(address(pm), 2_000_000e18);
+        weth.mint(address(pm), 1_000e18);
+        (uint256 r0, uint256 r1) = c0 == address(usdc) ? (uint256(2_000_000e18), uint256(1_000e18)) : (uint256(1_000e18), uint256(2_000_000e18));
+        pm.initialize(key, r0, r1);
         _seed(f3.createPool(address(usdc), address(weth), 3000), usdc, 2_000_000e18, weth, 1_000e18);
         _seed(f3.createPool(address(weth), address(dai), 500), weth, 1_000e18, dai, 2_000_000e18);
         address pair = f2.createPair(address(usdc), address(weth));
@@ -259,5 +271,197 @@ contract RoutesTest is Test {
         fs[4] = _s(address(usdc), abi.encodeWithSelector(0x70a08231, address(acct)), true);
         vm.expectRevert(abi.encodeWithSelector(ZeroAllowSeal.Open.selector, 4, address(usdc), address(ur), 0));
         this.runBatch(fs);
+    }
+
+    function _v4(uint8 settle, bytes memory settleParams, uint256 amountIn) internal view returns (bytes memory) {
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            MockUniversalRouter.ExactInputSingleParams(key, address(usdc) == key.currency0, uint128(amountIn), 1, "")
+        );
+        params[1] = settleParams;
+        params[2] = abi.encode(address(weth), uint256(1));
+        return abi.encode(abi.encodePacked(uint8(0x06), settle, uint8(0x0f)), params);
+    }
+
+    function test_ur_v4_settle_from_router_balance_needs_no_permit2() public {
+        vm.startPrank(alice);
+        usdc.approve(address(p2), type(uint256).max);
+        p2.approve(address(usdc), address(ur), type(uint160).max, type(uint48).max);
+        bytes[] memory one = new bytes[](1);
+        one[0] = _v4(0x0c, abi.encode(address(usdc), uint256(100e18)), 100e18);
+        ur.execute(hex"10", one, block.timestamp);
+        vm.stopPrank();
+        assertGt(weth.balanceOf(alice), 0);
+        assertEq(usdc.balanceOf(alice), 900e18);
+
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = _v4(0x0b, abi.encode(address(usdc), uint256(0), false), 100e18);
+        inputs[1] = abi.encode(address(usdc), MSG_SENDER, uint256(0));
+        F[] memory fs = _tx(
+            _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(ur), 100e18), true),
+            _s(address(ur), abi.encodeWithSignature("execute(bytes,bytes[],uint256)", hex"1004", inputs, block.timestamp), false)
+        );
+        _validate(fs);
+        this.runBatch(fs);
+        assertGt(weth.balanceOf(address(acct)), 0);
+        assertEq(usdc.balanceOf(address(acct)), 900e18);
+        assertEq(usdc.balanceOf(address(ur)) + weth.balanceOf(address(ur)), 0);
+
+        vm.startPrank(attacker);
+        ur.multicall(address(p2), abi.encodeCall(p2.transferFrom, (alice, attacker, 900e18, address(usdc))));
+        vm.expectRevert(bytes("call"));
+        ur.multicall(address(p2), abi.encodeCall(p2.transferFrom, (address(acct), attacker, 1, address(usdc))));
+        vm.stopPrank();
+    }
+
+    function test_ur_v4_overfunded_settle_returns_the_rest() public {
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = _v4(0x0b, abi.encode(address(usdc), uint256(0), false), 60e18);
+        inputs[1] = abi.encode(address(usdc), MSG_SENDER, uint256(0));
+        this.runBatch(
+            _tx(
+                _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(ur), 100e18), true),
+                _s(address(ur), abi.encodeWithSignature("execute(bytes,bytes[],uint256)", hex"1004", inputs, block.timestamp), false)
+            )
+        );
+        assertEq(usdc.balanceOf(address(acct)), 940e18);
+        assertEq(usdc.balanceOf(address(ur)), 0);
+    }
+
+    function test_greedy_router_takes_whatever_the_bracket_allows() public {
+        GreedyRouter g = new GreedyRouter();
+        weth.mint(address(g), 1_000e18);
+        usdc.mint(address(g), 1_000_000e18);
+        bytes memory swap = abi.encodeCall(GreedyRouter.swapExactIn, (address(usdc), address(weth), 100e18, 0, address(acct)));
+        F[] memory fs = new F[](5);
+        fs[0] = F(1, 3, address(acct), 0, abi.encodeWithSelector(0xce4d01a3, uint256(0)));
+        fs[1] = _s(address(usdc), abi.encodeWithSelector(0x095ea7b3, address(g), 1_000e18), true);
+        fs[2] = _s(address(g), swap, true);
+        fs[3] = _s(address(usdc), abi.encodeWithSelector(0x095ea7b3, address(g), 0), true);
+        fs[4] = _s(address(seal), abi.encodeCall(ZeroAllowSeal.checkFrames, (new ZeroAllowSeal.Out[](0))), false);
+        uint256 snap = vm.snapshotState();
+        this.runBatch(fs);
+        assertEq(usdc.balanceOf(address(acct)), 0);
+        vm.revertToState(snap);
+        fs[1] = _s(address(usdc), abi.encodeWithSelector(0x095ea7b3, address(g), 100e18), true);
+        this.runBatch(fs);
+        assertEq(usdc.balanceOf(address(acct)), 900e18);
+        assertEq(usdc.allowance(address(acct), address(g)), 0);
+    }
+
+    function test_ur_permit2_transfer_from_becomes_a_plain_transfer() public {
+        bytes memory swapAll = abi.encode(MSG_SENDER, uint256(1) << 255, uint256(1), _path1(), false);
+        vm.startPrank(alice);
+        usdc.approve(address(p2), type(uint256).max);
+        p2.approve(address(usdc), address(ur), type(uint160).max, type(uint48).max);
+        bytes[] memory asked = new bytes[](2);
+        asked[0] = abi.encode(address(usdc), address(2), uint160(100e18));
+        asked[1] = swapAll;
+        ur.execute(hex"0200", asked, block.timestamp);
+        vm.stopPrank();
+        assertEq(usdc.balanceOf(alice), 900e18);
+
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = swapAll;
+        inputs[1] = abi.encode(address(usdc), MSG_SENDER, uint256(0));
+        F[] memory fs = _tx(
+            _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(ur), 100e18), true),
+            _s(address(ur), abi.encodeWithSignature("execute(bytes,bytes[],uint256)", hex"0004", inputs, block.timestamp), false)
+        );
+        _validate(fs);
+        this.runBatch(fs);
+        assertEq(usdc.balanceOf(address(acct)), 900e18);
+        assertGt(weth.balanceOf(address(acct)), 0);
+        assertEq(usdc.balanceOf(address(ur)), 0);
+    }
+
+    function test_v2_exact_out_matches_router_and_refunds() public {
+        address[] memory path = new address[](2);
+        (path[0], path[1]) = (address(usdc), address(weth));
+        address[] memory pairs = new address[](1);
+        pairs[0] = f2.getPair(address(usdc), address(weth));
+        MockV2Router r2 = new MockV2Router(address(f2));
+        uint256 snap = vm.snapshotState();
+        vm.startPrank(alice);
+        usdc.approve(address(r2), type(uint256).max);
+        uint256 viaRouter = r2.swapTokensForExactTokens(1e16, 50e18, path, alice, block.timestamp)[0];
+        vm.stopPrank();
+        vm.revertToState(snap);
+
+        F[] memory fs = _tx(
+            _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(sw), 50e18), true),
+            _s(address(sw), abi.encodeCall(sw.swapV2ExactOut, (pairs, address(usdc), 1e16, 50e18, address(acct), block.timestamp, 30)), false)
+        );
+        _validate(fs);
+        this.runBatch(fs);
+        assertEq(weth.balanceOf(address(acct)), 1e16);
+        assertEq(usdc.balanceOf(address(acct)), 1_000e18 - viaRouter);
+        assertEq(usdc.balanceOf(address(sw)), 0);
+        vm.expectRevert();
+        this.runBatch(
+            _tx(
+                _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(sw), 1e18), true),
+                _s(address(sw), abi.encodeCall(sw.swapV2ExactOut, (pairs, address(usdc), 1e16, 1e18, address(acct), block.timestamp, 30)), false)
+            )
+        );
+    }
+
+    function test_swaprouter02_v2_functions() public {
+        address[] memory path = new address[](2);
+        (path[0], path[1]) = (address(usdc), address(weth));
+        vm.startPrank(alice);
+        usdc.approve(address(r3), type(uint256).max);
+        uint256 out = r3.swapExactTokensForTokens(10e18, 1, path, MSG_SENDER);
+        uint256 spent = r3.swapTokensForExactTokens(1e15, 10e18, path, alice);
+        vm.stopPrank();
+        assertEq(weth.balanceOf(alice), out + 1e15);
+        assertEq(usdc.balanceOf(alice), 1_000e18 - 10e18 - spent);
+    }
+
+    function _nativePool() internal returns (MockPoolManager.PoolKey memory k) {
+        k = MockPoolManager.PoolKey(address(0), address(usdc), 3000, 60, address(0));
+        vm.deal(address(pm), 1_000 ether);
+        usdc.mint(address(pm), 2_000_000e18);
+        pm.initialize(k, 1_000 ether, 2_000_000e18);
+    }
+
+    function _plan(MockPoolManager.PoolKey memory k, bool ethIn, uint256 amountIn, bytes memory settle, address takeCurrency)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(MockUniversalRouter.ExactInputSingleParams(k, ethIn, uint128(amountIn), 1, ""));
+        params[1] = settle;
+        params[2] = abi.encode(takeCurrency, uint256(1));
+        return abi.encode(abi.encodePacked(uint8(0x06), ethIn ? uint8(0x0c) : uint8(0x0b), uint8(0x0f)), params);
+    }
+
+    function test_v4_native_eth_in_and_out() public {
+        MockPoolManager.PoolKey memory k = _nativePool();
+        vm.deal(address(acct), 10 ether);
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = _plan(k, true, 1 ether, abi.encode(address(0), uint256(1 ether)), address(usdc));
+        inputs[1] = abi.encode(address(0), MSG_SENDER, uint256(0));
+        F[] memory fs = new F[](2);
+        fs[0] = F(1, 3, address(acct), 0, abi.encodeWithSelector(0xce4d01a3, uint256(0)));
+        fs[1] = F(2, 0, address(ur), 1 ether, abi.encodeWithSignature("execute(bytes,bytes[],uint256)", hex"1004", inputs, block.timestamp));
+        _validate(fs);
+        this.runBatch(fs);
+        assertEq(address(acct).balance, 9 ether);
+        assertGt(usdc.balanceOf(address(acct)), 1_000e18);
+        assertEq(address(ur).balance, 0);
+
+        uint256 ethBefore = address(acct).balance;
+        inputs[0] = _plan(k, false, 100e18, abi.encode(address(usdc), uint256(0), false), address(0));
+        inputs[1] = abi.encode(address(usdc), MSG_SENDER, uint256(0));
+        this.runBatch(
+            _tx(
+                _s(address(usdc), abi.encodeWithSelector(0xa9059cbb, address(ur), 100e18), true),
+                _s(address(ur), abi.encodeWithSignature("execute(bytes,bytes[],uint256)", hex"1004", inputs, block.timestamp), false)
+            )
+        );
+        assertGt(address(acct).balance, ethBefore);
+        assertEq(usdc.balanceOf(address(ur)), 0);
     }
 }

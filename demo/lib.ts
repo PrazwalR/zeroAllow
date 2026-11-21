@@ -30,7 +30,7 @@ export const hegota = defineChain({
   rpcUrls: { default: { http: [rpcUrl] } },
   testnet: true,
 })
-export const pub = createPublicClient({ chain: hegota, transport: http(rpcUrl) })
+export const pub = createPublicClient({ chain: hegota, transport: http(rpcUrl, { timeout: 60_000, retryCount: 5 }) })
 export const frames = frameActions(pub)
 
 export const keys = {
@@ -42,9 +42,12 @@ export const keys = {
   today: keccak256(concatHex([key, toHex('today-7702')])),
   asked: keccak256(concatHex([key, toHex('direct-asked')])),
   direct: keccak256(concatHex([key, toHex('direct-routed')])),
+  greedySpec: keccak256(concatHex([key, toHex('greedy-spec')])),
+  greedyBracket: keccak256(concatHex([key, toHex('greedy-bracket')])),
+  greedyTight: keccak256(concatHex([key, toHex('greedy-tight')])),
 }
 export const addr = (k: Hex) => privateKeyToAccount(k).address
-export const wallet = (k: Hex) => createWalletClient({ account: privateKeyToAccount(k), chain: hegota, transport: http(rpcUrl) })
+export const wallet = (k: Hex) => createWalletClient({ account: privateKeyToAccount(k), chain: hegota, transport: http(rpcUrl, { timeout: 60_000, retryCount: 5 }) })
 
 export function artifact(file: string, name = file.replace(/\.(sol|yul)$/, '')) {
   const j = JSON.parse(readFileSync(`${root}contracts/out/${file}/${name}.json`, 'utf8'))
@@ -64,17 +67,17 @@ export async function deploy(label: string, file: string, args: unknown[] = [], 
   const { abi, bytecode } = artifact(file, name)
   const w = wallet(keys.deployer)
   const hash = await w.sendTransaction({ to: CREATE2_DEPLOYER, data: concatHex([SALT, encodeDeployData({ abi, bytecode, args })]) })
-  const r = await pub.waitForTransactionReceipt({ hash })
+  const r = await pub.waitForTransactionReceipt({ timeout: 600_000, hash })
   if (r.status !== 'success' || !(await pub.getCode({ address: at }))) throw new Error(`deploy ${label} failed`)
   console.log(`  deployed ${label.padEnd(14)} ${at}`)
   return at
 }
 
-export async function fund(to: Address, eth = '0.05') {
+export async function fund(to: Address, eth = '0.005') {
   const bal = await pub.getBalance({ address: to })
   if (bal >= parseEther(eth) / 2n) return
   const hash = await wallet(keys.deployer).sendTransaction({ to, value: parseEther(eth) })
-  await pub.waitForTransactionReceipt({ hash })
+  await pub.waitForTransactionReceipt({ timeout: 600_000, hash })
 }
 
 export async function send(p: { sender: Address; signerKey: Hex; frames: FrameSpec[]; limits?: (f: FrameSpec, i: number) => Limits; dryRun?: boolean }) {
@@ -87,7 +90,7 @@ export async function send(p: { sender: Address; signerKey: Hex; frames: FrameSp
     : await planTx(pub, base, p.signerKey)
   if (p.dryRun || !sim.valid) return { sim, raw }
   const hash = await broadcast(pub, raw)
-  const receipt = await frames.waitForFrameTransactionReceipt({ hash, timeout: 120_000 })
+  const receipt = await frames.waitForFrameTransactionReceipt({ hash, timeout: 600_000 })
   return { sim, raw, hash, receipt }
 }
 

@@ -104,3 +104,22 @@ console.log(`   compiled by zeroallow: valid=${rx.sim.valid}, guard ${verdict(xg
 table(xgood, rx.receipt?.frameReceipts.map((f) => `${f.status} gas=${f.gasUsed}`))
 const xleft = await pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [X, d.router] })
 console.log(`   allowance left to router: ${formatEther(xleft)}   tx ${rx.hash}`)
+
+console.log('\n6. Coinbase Smart Wallet and LightAccount style accounts: their own executeBatch formats, same policy at VERIFY')
+for (const [name, X, kind] of [
+  ['Coinbase-style executeBatch(Call[])', d.coinbase, 'coinbase'],
+  ['LightAccount-style executeBatch(address[],uint256[],bytes[])', d.lightaccount, 'lightaccount'],
+] as const) {
+  const wcalls: Call[] = [
+    { to: d.usdc, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [d.router, maxUint256] }) },
+    { to: d.router, data: encodeFunctionData({ abi: routerAbi, functionName: 'swapExactIn', args: [d.usdc, d.weth, amount, 0n, X] }) },
+  ]
+  const wbad = specExample({ account: kind, sender: X, calls: wcalls })
+  const rbad = await send({ sender: X, signerKey: keys.deployer, frames: wbad, dryRun: true })
+  const wgood = compile({ sender: X, seal: d.seal, permit2: PERMIT2, account: kind, calls: wcalls }).frames
+  const rgood = await send({ sender: X, signerKey: keys.deployer, frames: wgood })
+  const wleft = await pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [X, d.router] })
+  console.log(`   ${name}`)
+  console.log(`      spec Example 2 shape: guard ${guard(wbad, X, d.seal, PERMIT2, true).reason}, chain valid=${rbad.sim.valid}`)
+  console.log(`      compiled: valid=${rgood.sim.valid}, VERIFY gas ${rgood.receipt?.frameReceipts[0].gasUsed}, batch ${rgood.receipt?.frameReceipts[1].status}, allowance left ${formatEther(wleft)}   tx ${rgood.hash}`)
+}

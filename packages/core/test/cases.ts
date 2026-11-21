@@ -1,5 +1,5 @@
 import { concatHex, encodeFunctionData, getAddress, maxUint256, padHex, parseAbi, type Address, type Hex } from 'viem'
-import { ATOMIC, CODE, EXEC_MODE, MODE, compile, delegationAbi, e6909Abi, erc20Abi, executeAbi, executeFrame, nftAbi, sealAbi, specExample, verifyFrame, type Call, type FrameSpec } from '../src/index.js'
+import { ATOMIC, CODE, EXEC_MODE, MODE, coinbaseAbi, compile, delegationAbi, dispatchFrame, e6909Abi, erc20Abi, executeAbi, executeFrame, lightAccountAbi, nftAbi, sealAbi, specExample, verifyFrame, type Call, type FrameSpec } from '../src/index.js'
 
 export const S: Address = '0x1111111111111111111111111111111111111111'
 export const SEAL: Address = getAddress('0x5ea15ea15ea15ea15ea15ea15ea15ea15ea15ea1')
@@ -108,4 +108,13 @@ export const cases: Case[] = [
   { name: 'dispatched two seals', frames: [dv, ex([{ to: T, data: approve(R, 1n) }, { to: T, data: approve(R, 0n) }, sealCall, { to: T, data: approve(P2, 7n) }, sealCall])], code: CODE.OK, at: 0, dispatch: true },
   { name: 'dispatched then unsealed frame grant', frames: [dv, ex(dBracket), f(T, approve(R, 1n), true), f(R, swap(1n), false)], code: CODE.UNSEALED, at: 2, dispatch: true },
   { name: 'execute frame without dispatch support', frames: [dv, ex(dBracket)], code: CODE.SELF_CALL, at: 1 },
+  { name: 'coinbase compiled bracket', frames: compile({ sender: S, seal: SEAL, account: 'coinbase', calls: [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }] }).frames, code: CODE.OK, at: 0, dispatch: true },
+  { name: 'coinbase spec example 2', frames: specExample({ account: 'coinbase', sender: S, calls: [{ to: T, data: approve(R, maxUint256) }, { to: R, data: swap(1n) }] }), code: CODE.UNSEALED, at: 1, dispatch: true },
+  { name: 'coinbase single execute grant', frames: [dv, { ...f(S, encodeFunctionData({ abi: coinbaseAbi, functionName: 'execute', args: [T, 0n, approve(R, 5n)] }), false), target: S }], code: CODE.OUTSIDE_BATCH, at: 1, dispatch: true },
+  { name: 'lightaccount compiled bracket', frames: compile({ sender: S, seal: SEAL, account: 'lightaccount', calls: [{ to: T, data: approve(R, 100n) }, { to: R, data: swap(100n) }] }).frames, code: CODE.OK, at: 0, dispatch: true },
+  { name: 'lightaccount spec example 2', frames: specExample({ account: 'lightaccount', sender: S, calls: [{ to: T, data: approve(R, maxUint256) }, { to: R, data: swap(1n) }] }), code: CODE.UNSEALED, at: 1, dispatch: true },
+  { name: 'lightaccount mismatched arrays', frames: [dv, f(S, encodeFunctionData({ abi: lightAccountAbi, functionName: 'executeBatch', args: [[T, R, T], [approve(R, 1n), swap(1n)]] }), false)], code: CODE.UNPARSEABLE, at: 1, dispatch: true },
+  { name: 'lightaccount no-value batch', frames: [dv, f(S, encodeFunctionData({ abi: lightAccountAbi, functionName: 'executeBatch', args: [[T, R, T, SEAL], dBracket.map((c) => c.data)] }), false)], code: CODE.OK, at: 0, dispatch: true },
+  { name: 'unknown self selector with dispatch', frames: [dv, f(S, '0xdeadbeef', false)], code: CODE.SELF_CALL, at: 1, dispatch: true },
+  { name: 'dispatch frame helper parity', frames: [dv, dispatchFrame(S, dBracket, 'dispatched')], code: CODE.OK, at: 0, dispatch: true },
 ]

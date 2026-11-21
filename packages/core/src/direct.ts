@@ -16,12 +16,23 @@ import { KIND, PERMIT2, erc20Abi } from './constants.js'
 import type { CompileInput } from './compile.js'
 import { classify, isGrant } from './registry.js'
 import type { Call } from './types.js'
-import { CMD, COMMAND_TYPE_MASK, CONTRACT_BALANCE, MSG_SENDER, ADDRESS_THIS, decodeUr, encodeUr, setWord, swapTokenIn, sweep, word } from './ur.js'
+import { CMD, COMMAND_TYPE_MASK, CONTRACT_BALANCE, MSG_SENDER, ADDRESS_THIS, decodeUr, encodeUr, isUr, rewriteV4, setWord, swapTokenIn, sweep, word } from './ur.js'
+import { decodeAbiParameters, parseAbiParameters } from 'viem'
 
 export const v2RouterAbi = parseAbi([
   'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])',
   'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
   'function factory() view returns (address)',
+])
+
+export const swapRouter02V2Abi = parseAbi([
+  'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to) payable returns (uint256)',
+  'function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] path, address to) payable returns (uint256)',
+  'function factoryV2() view returns (address)',
+])
+
+export const v2ExactOutAbi = parseAbi([
+  'function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] path, address to, uint256 deadline) returns (uint256[])',
 ])
 
 export const v3RouterAbi = parseAbi([
@@ -45,6 +56,7 @@ const factoryAbi = parseAbi([
 
 export const swapperAbi = parseAbi([
   'function swapV2(address[] pairs, address tokenIn, uint256 minOut, address to, uint256 deadline, uint256 feeBps) returns (uint256)',
+  'function swapV2ExactOut(address[] pairs, address tokenIn, uint256 amountOut, uint256 amountInMax, address to, uint256 deadline, uint256 feeBps) returns (uint256)',
   'function swapV3(bytes path, address factory, uint256 amountIn, uint256 minOut, address to, uint256 deadline) returns (uint256)',
   'error Expired()',
   'error Locked()',
@@ -57,6 +69,9 @@ export const swapperAbi = parseAbi([
 
 const SEL = {
   v2: new Set(['0x38ed1739', '0x5c11d795']),
+  v2ExactOut: '0x8803dbee',
+  v2In02: '0x472b43f3',
+  v2Out02: '0x42712a67',
   v3Single02: '0x04e45aaf',
   v3Single1: '0x414bf389',
   v3Path02: '0xb858183f',
@@ -116,20 +131,58 @@ async function poolsExist(client: Client, factory: Address, path: Hex): Promise<
   return true
 }
 
-async function v2Swap(ctx: Ctx, router: Address, data: Hex): Promise<Rewrite> {
-  const { args } = decodeFunctionData({ abi: v2RouterAbi, data })
-  const [amountIn, amountOutMin, path, to, deadline] = args as readonly [bigint, bigint, readonly Address[], Address, bigint]
-  const factory = await factoryOf(ctx.client, router)
-  const pairs = factory && (await pairsFor(ctx.client, factory, path))
+type V2Plan = { exactOut: boolean; amount: bigint; limit: bigint; path: readonly Address[]; to: Address; deadline: bigint; factory: Address | null }
+
+async function v2Plan(ctx: Ctx, router: Address, p: V2Plan): Promise<Rewrite> {
+  if (!p.factory || p.amount === 0n) return null
+  const pairs = await pairsFor(ctx.client, p.factory, p.path)
   if (!pairs) return null
   const feeBps = ctx.o.feeBps?.[router.toLowerCase()] ?? 30n
+  const tokenIn = getAddress(p.path[0])
+  if (!p.exactOut) {
+    return {
+      calls: [
+        transfer(tokenIn, pairs[0], p.amount),
+        { to: ctx.o.swapper, data: encodeFunctionData({ abi: swapperAbi, functionName: 'swapV2', args: [pairs, tokenIn, p.limit, p.to, p.deadline, feeBps] }) },
+      ],
+      note: `direct: ${router} V2 swap sent straight to ${pairs.length} pair(s)`,
+    }
+  }
   return {
     calls: [
-      transfer(getAddress(path[0]), pairs[0], amountIn),
-      { to: ctx.o.swapper, data: encodeFunctionData({ abi: swapperAbi, functionName: 'swapV2', args: [pairs, getAddress(path[0]), amountOutMin, to, deadline, feeBps] }) },
+      transfer(tokenIn, ctx.o.swapper, p.limit),
+      { to: ctx.o.swapper, data: encodeFunctionData({ abi: swapperAbi, functionName: 'swapV2ExactOut', args: [pairs, tokenIn, p.amount, p.limit, p.to, p.deadline, feeBps] }) },
     ],
-    note: `direct: ${router} V2 swap sent straight to ${pairs.length} pair(s)`,
+    note: `direct: ${router} V2 exact-output swap paid from the swapper, unused input refunded`,
   }
+}
+
+async function factoryV2Of(client: Client, router: Address): Promise<Address | null> {
+  try {
+    return getAddress(await readContract(client, { address: router, abi: swapRouter02V2Abi, functionName: 'factoryV2' }))
+  } catch {
+    return null
+  }
+}
+
+async function v2Swap(ctx: Ctx, router: Address, data: Hex): Promise<Rewrite> {
+  const sel = data.slice(0, 10).toLowerCase()
+  if (sel === SEL.v2ExactOut) {
+    const { args } = decodeFunctionData({ abi: v2ExactOutAbi, data })
+    const [amountOut, amountInMax, path, to, deadline] = args
+    return v2Plan(ctx, router, { exactOut: true, amount: amountOut, limit: amountInMax, path, to: getAddress(to), deadline, factory: await factoryOf(ctx.client, router) })
+  }
+  if (sel === SEL.v2In02 || sel === SEL.v2Out02) {
+    const { args } = decodeFunctionData({ abi: swapRouter02V2Abi, data })
+    const [amount, limit, path, rawTo] = args as readonly [bigint, bigint, readonly Address[], Address]
+    let to = getAddress(rawTo)
+    if (to === MSG_SENDER) to = ctx.sender
+    if (to === ADDRESS_THIS || to === router) return null
+    return v2Plan(ctx, router, { exactOut: sel === SEL.v2Out02, amount, limit, path, to, deadline: ctx.deadline ?? maxUint256, factory: await factoryV2Of(ctx.client, router) })
+  }
+  const { args } = decodeFunctionData({ abi: v2RouterAbi, data })
+  const [amountIn, amountOutMin, path, to, deadline] = args as readonly [bigint, bigint, readonly Address[], Address, bigint]
+  return v2Plan(ctx, router, { exactOut: false, amount: amountIn, limit: amountOutMin, path, to: getAddress(to), deadline, factory: await factoryOf(ctx.client, router) })
 }
 
 async function v3Swap(ctx: Ctx, router: Address, data: Hex, v1: boolean): Promise<Rewrite> {
@@ -159,21 +212,56 @@ async function v3Swap(ctx: Ctx, router: Address, data: Hex, v1: boolean): Promis
   }
 }
 
-function urSwap(sender: Address, router: Address, data: Hex): Rewrite {
+const permit2Batch = parseAbiParameters('(address from, address to, uint160 amount, address token)[]')
+const permit2Pull = parseAbiParameters('address, address, uint160')
+const tokenTo = parseAbiParameters('address, address')
+const toOnly = parseAbiParameters('address')
+
+function urSwap(sender: Address, router: Address, data: Hex, value: bigint): Rewrite {
   const u = decodeUr(data)
   if (!u) return null
   const pulls = new Map<Address, bigint>()
+  const surplus = new Set<Address>()
+  const spends: { token: Address | null; to: Address | null }[] = []
+  const direct: Call[] = []
   const commands: number[] = []
   const inputs: Hex[] = []
+  let started = false
+  const keep = (c: number, input: Hex) => {
+    started = true
+    commands.push(c)
+    inputs.push(input)
+  }
   for (let i = 0; i < u.commands.length; i++) {
     const c = u.commands[i]
     const type = c & COMMAND_TYPE_MASK
     const input = u.inputs[i]
     if (type === CMD.PERMIT2_PERMIT || type === CMD.PERMIT2_PERMIT_BATCH) continue
+    if (type === CMD.PERMIT2_TRANSFER_FROM) {
+      if (started) return null
+      const [token, rawTo, amount] = decodeAbiParameters(permit2Pull, input)
+      const to = getAddress(rawTo)
+      if (amount === 0n || to === MSG_SENDER) continue
+      if (to === ADDRESS_THIS || to === router) pulls.set(getAddress(token), (pulls.get(getAddress(token)) ?? 0n) + amount)
+      else direct.push(transfer(getAddress(token), to, amount))
+      continue
+    }
+    if (type === CMD.PERMIT2_TRANSFER_FROM_BATCH) {
+      if (started) return null
+      const [details] = decodeAbiParameters(permit2Batch, input)
+      for (const d of details) {
+        const to = getAddress(d.to)
+        if (getAddress(d.from) !== sender || to === MSG_SENDER || to === ADDRESS_THIS) return null
+        if (d.amount === 0n) continue
+        if (to === router) pulls.set(getAddress(d.token), (pulls.get(getAddress(d.token)) ?? 0n) + d.amount)
+        else direct.push(transfer(getAddress(d.token), to, d.amount))
+      }
+      continue
+    }
     if (type === CMD.V3_SWAP_EXACT_IN || type === CMD.V3_SWAP_EXACT_OUT || type === CMD.V2_SWAP_EXACT_IN || type === CMD.V2_SWAP_EXACT_OUT) {
       if (word(input, 4) === 0n) {
-        commands.push(c)
-        inputs.push(input)
+        spends.push({ token: swapTokenIn(type, input), to: null })
+        keep(c, input)
         continue
       }
       const exactIn = type === CMD.V3_SWAP_EXACT_IN || type === CMD.V2_SWAP_EXACT_IN
@@ -181,34 +269,69 @@ function urSwap(sender: Address, router: Address, data: Hex): Rewrite {
       if (amount === 0n || amount >= CONTRACT_BALANCE) return null
       const token = swapTokenIn(type, input)
       pulls.set(token, (pulls.get(token) ?? 0n) + amount)
-      commands.push(c)
-      inputs.push(setWord(input, 4, 0n))
+      surplus.add(token)
+      keep(c, setWord(input, 4, 0n))
       continue
     }
-    if (type === CMD.SWEEP || type === CMD.PAY_PORTION || type === CMD.PAY_PORTION_FULL_PRECISION || type === CMD.UNWRAP_WETH || type === CMD.BALANCE_CHECK_ERC20) {
-      commands.push(c)
-      inputs.push(input)
+    if (type === CMD.V4_SWAP) {
+      const v4 = rewriteV4(input)
+      if (!v4) return null
+      for (const [token, amount] of v4.pulls) pulls.set(token, (pulls.get(token) ?? 0n) + amount)
+      for (const t of v4.surplus) surplus.add(t)
+      for (const t of v4.fromRouter) spends.push({ token: t, to: null })
+      keep(c, v4.input)
+      continue
+    }
+    if (type === CMD.SWEEP || type === CMD.PAY_PORTION || type === CMD.PAY_PORTION_FULL_PRECISION) {
+      const [token, to] = decodeAbiParameters(tokenTo, input)
+      spends.push({ token: getAddress(token), to: getAddress(to) })
+      keep(c, input)
+      continue
+    }
+    if (type === CMD.UNWRAP_WETH) {
+      spends.push({ token: null, to: getAddress(decodeAbiParameters(toOnly, input)[0]) })
+      keep(c, input)
+      continue
+    }
+    if (
+      type === CMD.BALANCE_CHECK_ERC20 ||
+      (type === CMD.WRAP_ETH && value > 0n)
+    ) {
+      keep(c, input)
       continue
     }
     return null
   }
-  if (!pulls.size) return null
+  if (!pulls.size && !direct.length) return null
+  const ours = (a: Address) => a === MSG_SENDER || a === ADDRESS_THIS || a === router || a === getAddress(sender)
+  for (const s of spends) {
+    const hit = s.token === null ? surplus.size > 0 : surplus.has(s.token)
+    if (hit && (s.to === null || !ours(s.to))) return null
+  }
   for (const token of pulls.keys()) {
     commands.push(CMD.SWEEP)
     inputs.push(sweep(token))
   }
+  if (value > 0n) {
+    commands.push(CMD.SWEEP)
+    inputs.push(sweep('0x0000000000000000000000000000000000000000'))
+  }
   return {
-    calls: [...[...pulls].map(([token, amount]) => transfer(token, router, amount)), { to: router, data: encodeUr({ commands, inputs, deadline: u.deadline }) }],
-    note: `direct: ${router} Universal Router swap paid from its own balance (payerIsUser=false), no Permit2 grant, leftovers swept back`,
+    calls: [
+      ...direct,
+      ...[...pulls].map(([token, amount]) => transfer(token, router, amount)),
+      { to: router, data: encodeUr({ commands, inputs, deadline: u.deadline }), value },
+    ],
+    note: `direct: ${router} Universal Router swap paid from its own balance (payerIsUser=false), no Permit2 grant or pull, leftovers swept back`,
   }
 }
 
 async function rewrite(ctx: Ctx, call: Call): Promise<Rewrite> {
-  if ((call.value ?? 0n) > 0n) return null
+  if ((call.value ?? 0n) > 0n && !isUr(call.data)) return null
   const router = getAddress(call.to)
   const sel = call.data.slice(0, 10).toLowerCase()
   try {
-    if (SEL.v2.has(sel)) return await v2Swap(ctx, router, call.data)
+    if (SEL.v2.has(sel) || sel === SEL.v2ExactOut || sel === SEL.v2In02 || sel === SEL.v2Out02) return await v2Swap(ctx, router, call.data)
     if (sel === SEL.v3Single02 || sel === SEL.v3Path02) return await v3Swap(ctx, router, call.data, false)
     if (sel === SEL.v3Single1 || sel === SEL.v3Path1) return await v3Swap(ctx, router, call.data, true)
     if (sel === SEL.multicall || sel === SEL.multicallDeadline) {
@@ -223,7 +346,7 @@ async function rewrite(ctx: Ctx, call: Call): Promise<Rewrite> {
       }
       return out.length ? { calls: out, note: `direct: ${router} multicall of ${inner.length} swap(s) unwrapped` } : null
     }
-    return urSwap(ctx.sender, router, call.data)
+    return urSwap(ctx.sender, router, call.data, call.value ?? 0n)
   } catch {
     return null
   }

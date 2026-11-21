@@ -26,7 +26,7 @@ const H = d.victims.hoarder
 const hw = wallet(keys.hoarder)
 
 const tx = async (w: ReturnType<typeof wallet>, to: Address, data: Hex) => {
-  const r = await pub.waitForTransactionReceipt({ hash: await w.sendTransaction({ to, data }) })
+  const r = await pub.waitForTransactionReceipt({ timeout: 600_000, hash: await w.sendTransaction({ to, data }) })
   if (r.status !== 'success') throw new Error(`tx to ${to} failed`)
 }
 const show = (found: Finding[]) => {
@@ -79,7 +79,7 @@ const tw = wallet(keys.today)
 const delegated = `0xef0100${d.executor.slice(2).toLowerCase()}`
 if ((await pub.getCode({ address: T }))?.toLowerCase() !== delegated) {
   const authorization = await tw.signAuthorization({ contractAddress: d.executor, executor: 'self' })
-  await pub.waitForTransactionReceipt({ hash: await tw.sendTransaction({ to: T, authorizationList: [authorization], chain: hegota }) })
+  await pub.waitForTransactionReceipt({ timeout: 600_000, hash: await tw.sendTransaction({ to: T, authorizationList: [authorization], chain: hegota }) })
 }
 console.log(`   ${T} code = ${await pub.getCode({ address: T })} (7702 delegation to BatchExecutor)`)
 const run = async (calls: Call[], label: string) => {
@@ -97,7 +97,7 @@ const run = async (calls: Call[], label: string) => {
     console.log(`   ${label}: preview (eth_call through the delegation) reverts ${why}`)
   }
   const hash = await tw.sendTransaction({ to: T, data, gas: 1_500_000n, chain: hegota })
-  const rc = await pub.waitForTransactionReceipt({ hash })
+  const rc = await pub.waitForTransactionReceipt({ timeout: 600_000, hash })
   console.log(`   ${label}: ${rc.status}  tx ${hash}`)
 }
 const allowance = () => pub.readContract({ address: d.usdc, abi: erc20Abi, functionName: 'allowance', args: [T, d.router] })

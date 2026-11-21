@@ -118,16 +118,16 @@ contract ZeroAllowSeal {
         }
         if (kind == ZeroAllowLib.PERMIT2) {
             if (permit2 == address(0)) return false;
-            return _atMost(permit2, abi.encodeWithSelector(0x927da105, owner, k.token, k.spender), MAX_RESIDUAL);
+            return _atMost(permit2, abi.encodeWithSelector(0x927da105, owner, k.token, k.spender), 0);
         }
         if (kind == ZeroAllowLib.E6909) {
-            return _atMost(k.token, abi.encodeWithSelector(0x598af9e7, owner, k.spender, k.id), MAX_RESIDUAL);
+            return _atMost(k.token, abi.encodeWithSelector(0x598af9e7, owner, k.spender, k.id), 0);
         }
         if (kind == ZeroAllowLib.E6909_OPERATOR) {
             return _atMost(k.token, abi.encodeWithSelector(0xb6363cf2, owner, k.spender), 0);
         }
         if (kind == ZeroAllowLib.DELEGATION) {
-            return _atMost(k.token, abi.encodeWithSelector(0x6bd76d24, owner, k.spender), MAX_RESIDUAL);
+            return _atMost(k.token, abi.encodeWithSelector(0x6bd76d24, owner, k.spender), 0);
         }
         if (kind == ZeroAllowLib.COMET) {
             return _atMost(k.token, abi.encodeWithSelector(0xa1654379, owner, k.spender), 0);

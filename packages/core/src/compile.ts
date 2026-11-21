@@ -11,8 +11,10 @@ import {
   delegationAbi,
   e6909Abi,
   erc20Abi,
+  coinbaseAbi,
   executeAbi,
   executionsParams,
+  lightAccountAbi,
   nftAbi,
   permit2Abi,
   sealAbi,
@@ -21,7 +23,9 @@ import { classify, isGrant } from './registry.js'
 import { decodeUr, nestedPermits } from './ur.js'
 import type { Call, Classified, FrameSpec, MinOut, Quirk, SealKey } from './types.js'
 
-export type AccountKind = 'eoa' | 'zeroallow' | 'dispatched'
+export type AccountKind = 'eoa' | 'zeroallow' | 'dispatched' | 'coinbase' | 'lightaccount'
+
+export const isDispatchedKind = (k?: AccountKind) => k === 'dispatched' || k === 'coinbase' || k === 'lightaccount'
 
 export type CompileInput = {
   sender: Address
@@ -47,10 +51,19 @@ export function verifyFrame(account: AccountKind = 'eoa', data?: Hex): FrameSpec
   const fallback =
     account === 'zeroallow'
       ? encodeFunctionData({ abi: accountAbi, functionName: 'validate', args: [0n] })
-      : account === 'dispatched'
+      : isDispatchedKind(account)
         ? encodeFunctionData({ abi: executeAbi, functionName: 'verify', args: ['0x'] })
         : '0x'
   return { mode: MODE.VERIFY, flags: SCOPE_EXECUTION_AND_PAYMENT, target: null, value: 0n, data: data ?? fallback, label: 'verify' }
+}
+
+export function dispatchFrame(sender: Address, calls: Call[], kind: AccountKind = 'dispatched'): FrameSpec {
+  if (kind === 'dispatched') return executeFrame(sender, calls)
+  const data =
+    kind === 'coinbase'
+      ? encodeFunctionData({ abi: coinbaseAbi, functionName: 'executeBatch', args: [calls.map((c) => ({ target: c.to, value: c.value ?? 0n, data: c.data }))] })
+      : encodeFunctionData({ abi: lightAccountAbi, functionName: 'executeBatch', args: [calls.map((c) => c.to), calls.map((c) => c.value ?? 0n), calls.map((c) => c.data)] })
+  return { mode: MODE.SENDER, flags: 0, target: sender, value: 0n, data, label: `executeBatch(${calls.length})` }
 }
 
 export function executeFrame(sender: Address, calls: Call[], mode: Hex = EXEC_MODE.BATCH, label = `execute(${calls.length})`): FrameSpec {
@@ -201,9 +214,9 @@ export function compile(input: CompileInput & { keys?: SealKey[] }): Compiled {
     label: 'seal.checkFrames',
   }
   const closed = sealed || extra.length > 0
-  if (input.account === 'dispatched') {
+  if (isDispatchedKind(input.account)) {
     const xs = closed ? [...steps, closer] : steps
-    return { frames: [verify, executeFrame(input.sender, xs)], grants, keys, notes }
+    return { frames: [verify, dispatchFrame(input.sender, xs, input.account)], grants, keys, notes }
   }
   if (!closed) return { frames: [verify, ...body.map((s, i) => frame(s, i < body.length - 1))], grants, keys, notes }
   return { frames: [verify, ...steps.map((s) => frame(s, true)), frame(closer, false)], grants, keys, notes }
@@ -226,9 +239,9 @@ export function compileCalls(input: Omit<CompileInput, 'account'> & { keys?: Sea
 }
 
 export function specExample(p: { calls: Call[]; account?: AccountKind; sender?: Address }): FrameSpec[] {
-  if (p.account === 'dispatched') {
+  if (isDispatchedKind(p.account)) {
     if (!p.sender) throw new Error('dispatched accounts need the sender address')
-    return [verifyFrame(p.account), executeFrame(p.sender, p.calls)]
+    return [verifyFrame(p.account), dispatchFrame(p.sender, p.calls, p.account)]
   }
   const body = p.calls.map((call, n) => frame({ ...call, label: `call ${n}` }, n < p.calls.length - 1))
   return [verifyFrame(p.account), ...body]
